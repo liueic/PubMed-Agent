@@ -5,7 +5,11 @@ Phase 4: Programmable thinking process - Query classification and specialized pr
 Enhanced with comprehensive Chinese language support.
 """
 
-from langchain.prompts import PromptTemplate
+# LangChain 1.0+ compatibility
+try:
+    from langchain_core.prompts import PromptTemplate
+except ImportError:
+    from langchain.prompts import PromptTemplate
 
 
 # ReAct prompt template with scientific reasoning focus (English)
@@ -76,6 +80,71 @@ Critical Rules:
 - Acknowledge limitations and conflicting evidence
 - Distinguish between established facts and hypotheses
 - Do not speculate beyond the available evidence
+
+Question: {input}
+Thought: {agent_scratchpad}"""
+
+
+# Template for processing complex queries (English)
+COMPLEX_QUERY_PROMPT = """You are processing a complex scientific query that may require multiple literature search and analysis steps.
+
+Break down the question into key components:
+1. Main topic/disease
+2. Specific mechanism or intervention
+3. Outcome or endpoint of interest
+4. Population or context
+
+Perform systematic searches for each component:
+- Start with broad searches, then narrow down
+- Store relevant articles for cross-referencing
+- Use semantic search to find connections between articles
+- Synthesize information from multiple sources
+
+Available tools:
+{tools}
+
+Question: {input}
+Thought: {agent_scratchpad}"""
+
+
+# Template for mechanism-focused queries (English)
+MECHANISM_PROMPT = """You are analyzing mechanisms of action, pathways, or biological processes. Focus on:
+
+1. Molecular mechanisms
+2. Cellular pathways
+3. Physiological processes
+4. Clinical implications
+
+Search strategy:
+- Look for mechanism studies
+- Find review articles for comprehensive overview
+- Search for recent advances and updates
+- Cross-reference findings across multiple sources
+
+Available tools:
+{tools}
+
+Question: {input}
+Thought: {agent_scratchpad}"""
+
+
+# Template for therapeutic/clinical queries (English)
+THERAPEUTIC_PROMPT = """You are analyzing therapeutic interventions, treatments, or clinical approaches. Focus on:
+
+1. Efficacy and effectiveness
+2. Safety and adverse effects
+3. Mechanisms of action
+4. Clinical guidelines and evidence levels
+5. Comparative effectiveness when relevant
+
+Search strategy:
+- Look for clinical trials and systematic reviews
+- Find meta-analyses and guidelines
+- Check for recent updates and warnings
+- Consider different populations and contexts
+
+Available tools:
+{tools}
 
 Question: {input}
 Thought: {agent_scratchpad}"""

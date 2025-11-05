@@ -9,9 +9,48 @@ Enhanced with comprehensive Chinese language support.
 
 import logging
 from typing import List, Dict, Any, Optional
-from langchain.agents import AgentExecutor, create_react_agent
+
+# LangChain imports with version compatibility
+# LangChain 1.0+ uses a different API, so we need to handle both old and new versions
+try:
+    # Try LangChain 1.0+ API first
+    from langchain.agents import create_agent
+    from langchain_core.runnables import RunnableConfig
+    LANGCHAIN_VERSION = "1.0+"
+    HAS_AGENT_EXECUTOR = False
+except ImportError:
+    LANGCHAIN_VERSION = "0.x"
+    HAS_AGENT_EXECUTOR = True
+    try:
+        # LangChain 0.2.x
+        from langchain.agents import AgentExecutor, create_react_agent
+    except ImportError:
+        try:
+            # LangChain 0.1.x - try alternative import paths
+            from langchain_core.agents import AgentExecutor
+            from langchain.agents import create_react_agent
+        except ImportError:
+            # Fallback for older versions
+            from langchain.agents.agent import AgentExecutor
+            from langchain.agents import create_react_agent
+
 from langchain_openai import ChatOpenAI
-from langchain.memory import ConversationBufferMemory
+
+# Memory handling - LangChain 1.0+ uses different memory API
+try:
+    from langchain.memory import ConversationBufferMemory
+    HAS_OLD_MEMORY = True
+except ImportError:
+    HAS_OLD_MEMORY = False
+    # LangChain 1.0+ uses checkpointer-based memory
+    MemorySaver = None
+    try:
+        from langchain_core.checkpoints import MemorySaver
+    except ImportError:
+        try:
+            from langgraph.checkpoint.memory import MemorySaver
+        except ImportError:
+            MemorySaver = None
 
 try:
     from langchain.schema import BaseMessage
@@ -72,50 +111,86 @@ class PubMedAgent:
         self.tools = create_tools(self.config)
         
         # Initialize memory for conversation context
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
-        )
+        if HAS_OLD_MEMORY:
+            self.memory = ConversationBufferMemory(
+                memory_key="chat_history",
+                return_messages=True
+            )
+        else:
+            # LangChain 1.0+ uses checkpointer
+            self.memory = MemorySaver() if MemorySaver else None
         
         # Create agent
         self.agent_executor = self._create_agent()
         
-        logger.info(f"PubMedAgent initialized successfully (language: {self.language})")
+        logger.info(f"PubMedAgent initialized successfully (language: {self.language}, LangChain: {LANGCHAIN_VERSION})")
     
-    def _create_agent(self) -> AgentExecutor:
+    def _create_agent(self):
         """
         Create the ReAct agent executor.
         
         Phase 1: Basic infrastructure - Agent creation
         Phase 2: Thought templates - Enhanced prompt integration
         Enhanced with Chinese language support.
+        Supports both LangChain 0.x and 1.0+ APIs.
         """
-        # Get tool names for the prompt
-        tool_names = [tool.name for tool in self.tools]
-        
-        # Create the base prompt template with language optimization
-        prompt = get_optimized_prompt("", language=self.language)
-        
-        # Create ReAct agent
-        agent = create_react_agent(
-            llm=self.llm,
-            tools=self.tools,
-            prompt=prompt
-        )
-        
-        # Create agent executor with enhanced configuration
-        agent_executor = AgentExecutor(
-            agent=agent,
-            tools=self.tools,
-            verbose=True,
-            memory=self.memory,
-            max_iterations=10,
-            early_stopping_method="generate",
-            handle_parsing_errors=True,
-            return_intermediate_steps=True
-        )
-        
-        return agent_executor
+        if LANGCHAIN_VERSION == "1.0+":
+            # LangChain 1.0+ API - use create_agent which returns a graph
+            from .prompts import get_chinese_templates, get_english_templates
+            
+            # Get appropriate system prompt based on language
+            if self.language == "zh":
+                templates = get_chinese_templates()
+                system_prompt = templates.get("chinese_scientific", templates["chinese"])
+            else:
+                templates = get_english_templates()
+                system_prompt = templates.get("scientific", templates["basic"])
+            
+            # Extract system prompt text from template
+            if hasattr(system_prompt, 'template'):
+                # It's a PromptTemplate, extract the template string
+                system_prompt_text = system_prompt.template.split("Question:")[0].strip()
+            else:
+                system_prompt_text = str(system_prompt)
+            
+            # Create agent graph (already compiled in LangChain 1.0+)
+            agent_executor = create_agent(
+                model=self.llm,
+                tools=self.tools,
+                system_prompt=system_prompt_text,
+                checkpointer=self.memory,
+                debug=True
+            )
+            
+            return agent_executor
+        else:
+            # LangChain 0.x API - use traditional AgentExecutor
+            # Get tool names for the prompt
+            tool_names = [tool.name for tool in self.tools]
+            
+            # Create the base prompt template with language optimization
+            prompt = get_optimized_prompt("", language=self.language)
+            
+            # Create ReAct agent
+            agent = create_react_agent(
+                llm=self.llm,
+                tools=self.tools,
+                prompt=prompt
+            )
+            
+            # Create agent executor with enhanced configuration
+            agent_executor = AgentExecutor(
+                agent=agent,
+                tools=self.tools,
+                verbose=True,
+                memory=self.memory,
+                max_iterations=10,
+                early_stopping_method="generate",
+                handle_parsing_errors=True,
+                return_intermediate_steps=True
+            )
+            
+            return agent_executor
     
     def query(self, question: str, prompt_type: Optional[str] = None, language: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -150,13 +225,41 @@ class PubMedAgent:
             if query_language != self.language or prompt_type != "scientific":
                 self.agent_executor = self._create_agent_with_prompt(prompt_type, query_language)
             
-            # Execute the query
-            result = self.agent_executor.invoke({"input": question})
+            # Execute the query - handle both LangChain 0.x and 1.0+ APIs
+            if LANGCHAIN_VERSION == "1.0+":
+                # LangChain 1.0+ uses different invoke signature
+                from langchain_core.messages import HumanMessage
+                config = {}
+                if self.memory:
+                    config = {"configurable": {"thread_id": "default"}}
+                
+                # Invoke with messages format
+                result = self.agent_executor.invoke(
+                    {"messages": [HumanMessage(content=question)]},
+                    config=config if config else None
+                )
+                
+                # Extract output from LangChain 1.0+ response format
+                # Result is a dict with "messages" key containing message objects
+                if isinstance(result, dict) and "messages" in result:
+                    messages = result["messages"]
+                    # Get the last assistant message
+                    assistant_messages = [msg for msg in messages if hasattr(msg, 'content') and msg.type == "ai"]
+                    if assistant_messages:
+                        output = assistant_messages[-1].content
+                    else:
+                        output = str(result)
+                else:
+                    output = str(result)
+            else:
+                # LangChain 0.x API
+                result = self.agent_executor.invoke({"input": question})
+                output = result.get("output", "")
             
             response = {
                 "question": question,
-                "answer": result.get("output", ""),
-                "intermediate_steps": result.get("intermediate_steps", []),
+                "answer": output,
+                "intermediate_steps": result.get("intermediate_steps", []) if isinstance(result, dict) else [],
                 "prompt_type": prompt_type,
                 "language": query_language,
                 "success": True
@@ -179,48 +282,79 @@ class PubMedAgent:
                 "error": str(e)
             }
     
-    def _create_agent_with_prompt(self, prompt_type: str, language: str) -> AgentExecutor:
+    def _create_agent_with_prompt(self, prompt_type: str, language: str):
         """
         Create agent executor with specific prompt type and language.
         
         Phase 4: Programmable thinking process - Dynamic prompt selection.
         Enhanced with Chinese language support.
+        Supports both LangChain 0.x and 1.0+ APIs.
         """
-        # Get tool names for the prompt
-        tool_names = [tool.name for tool in self.tools]
-        
-        # Create the specific prompt template with language support
-        if language == "zh":
-            from .prompts import get_chinese_templates
-            templates = get_chinese_templates()
-            template_key = f"chinese_{prompt_type}"
+        if LANGCHAIN_VERSION == "1.0+":
+            # LangChain 1.0+ API
+            from .prompts import get_chinese_templates, get_english_templates
+            
+            # Get appropriate system prompt based on language
+            if language == "zh":
+                templates = get_chinese_templates()
+                system_prompt = templates.get(f"chinese_{prompt_type}", templates.get("chinese_scientific", templates["chinese"]))
+            else:
+                templates = get_english_templates()
+                system_prompt = templates.get(prompt_type, templates.get("scientific", templates["basic"]))
+            
+            # Extract system prompt text from template
+            if hasattr(system_prompt, 'template'):
+                system_prompt_text = system_prompt.template.split("Question:")[0].strip()
+            else:
+                system_prompt_text = str(system_prompt)
+            
+            # Create agent graph (already compiled)
+            agent_executor = create_agent(
+                model=self.llm,
+                tools=self.tools,
+                system_prompt=system_prompt_text,
+                checkpointer=self.memory,
+                debug=True
+            )
+            
+            return agent_executor
         else:
-            from .prompts import get_english_templates
-            templates = get_english_templates()
-            template_key = prompt_type
-        
-        template = templates.get(template_key, templates["scientific"])
-        
-        # Create ReAct agent
-        agent = create_react_agent(
-            llm=self.llm,
-            tools=self.tools,
-            prompt=template
-        )
-        
-        # Create agent executor
-        agent_executor = AgentExecutor(
-            agent=agent,
-            tools=self.tools,
-            verbose=True,
-            memory=self.memory,
-            max_iterations=10,
-            early_stopping_method="generate",
-            handle_parsing_errors=True,
-            return_intermediate_steps=True
-        )
-        
-        return agent_executor
+            # LangChain 0.x API
+            # Get tool names for the prompt
+            tool_names = [tool.name for tool in self.tools]
+            
+            # Create the specific prompt template with language support
+            if language == "zh":
+                from .prompts import get_chinese_templates
+                templates = get_chinese_templates()
+                template_key = f"chinese_{prompt_type}"
+            else:
+                from .prompts import get_english_templates
+                templates = get_english_templates()
+                template_key = prompt_type
+            
+            template = templates.get(template_key, templates["scientific"])
+            
+            # Create ReAct agent
+            agent = create_react_agent(
+                llm=self.llm,
+                tools=self.tools,
+                prompt=template
+            )
+            
+            # Create agent executor
+            agent_executor = AgentExecutor(
+                agent=agent,
+                tools=self.tools,
+                verbose=True,
+                memory=self.memory,
+                max_iterations=10,
+                early_stopping_method="generate",
+                handle_parsing_errors=True,
+                return_intermediate_steps=True
+            )
+            
+            return agent_executor
     
     def search_and_store(self, query: str, max_results: int = 10) -> Dict[str, Any]:
         """
@@ -284,12 +418,23 @@ class PubMedAgent:
     
     def clear_memory(self) -> None:
         """Clear the conversation memory."""
-        self.memory.clear()
+        if HAS_OLD_MEMORY:
+            self.memory.clear()
+        else:
+            # LangChain 1.0+ uses checkpointer, clearing is handled differently
+            # For now, create a new MemorySaver instance
+            if MemorySaver:
+                self.memory = MemorySaver()
         logger.info("Conversation memory cleared")
     
     def get_conversation_history(self) -> List[BaseMessage]:
         """Get the conversation history."""
-        return self.memory.chat_memory.messages
+        if HAS_OLD_MEMORY:
+            return self.memory.chat_memory.messages
+        else:
+            # LangChain 1.0+ uses checkpointer, history is stored differently
+            # Return empty list for now as LangChain 1.0+ doesn't have direct chat_memory
+            return []
     
     def get_available_tools(self) -> List[str]:
         """
