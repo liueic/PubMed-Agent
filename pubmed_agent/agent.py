@@ -54,11 +54,19 @@ class PubMedAgent:
         self.language = language
         
         # Initialize LLM with controlled temperature for factual responses
-        self.llm = ChatOpenAI(
-            model=self.config.openai_model,
-            temperature=self.config.temperature,  # Phase 2: Temperature control for reduced hallucinations
-            openai_api_key=self.config.openai_api_key
-        )
+        # Support custom API endpoint for compatibility with OpenAI-compatible APIs
+        llm_kwargs = {
+            "model": self.config.openai_model,
+            "temperature": self.config.temperature,  # Phase 2: Temperature control for reduced hallucinations
+            "openai_api_key": self.config.openai_api_key
+        }
+        
+        # Add custom base_url if provided (for custom endpoints like local models, Azure, etc.)
+        if self.config.openai_api_base:
+            llm_kwargs["base_url"] = self.config.openai_api_base
+            logger.info(f"Using custom API endpoint: {self.config.openai_api_base}")
+        
+        self.llm = ChatOpenAI(**llm_kwargs)
         
         # Initialize tools
         self.tools = create_tools(self.config)

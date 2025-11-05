@@ -67,6 +67,41 @@ response2 = agent.query("mRNA疫苗的作用机制是什么？")
 
 ## 📦 Installation (安装)
 
+> 💡 **快速开始**: 查看 [QUICK_START.md](QUICK_START.md) 获取详细的安装和配置指南
+> 
+> 💡 **Quick Start**: See [QUICK_START.md](QUICK_START.md) for detailed installation and configuration guide
+
+### 方法1: 使用 uv (推荐 / Recommended)
+
+```bash
+# 安装 uv (如果尚未安装)
+# Install uv (if not already installed)
+# macOS/Linux:
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# Windows:
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# 克隆仓库
+# Clone repository
+git clone <repository-url>
+cd PubMed-Agent
+
+# 使用 uv 创建虚拟环境并安装依赖
+# Create virtual environment and install dependencies with uv
+uv venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# 安装依赖
+# Install dependencies
+uv pip install -r requirements.txt
+
+# 或者使用 uv 直接安装（更快）
+# Or use uv to install directly (faster)
+uv pip sync requirements.txt
+```
+
+### 方法2: 使用传统 pip (Traditional pip)
+
 ```bash
 # Clone repository (克隆仓库)
 git clone <repository-url>
@@ -78,11 +113,47 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install dependencies (安装依赖)
 pip install -r requirements.txt
-
-# Set up environment variables (设置环境变量)
-cp .env.example .env
-# Edit .env with your API keys (编辑.env文件填入API密钥)
 ```
+
+### 环境变量配置 (Environment Variables Setup)
+
+```bash
+# 复制环境变量模板文件
+# Copy environment variables template
+cp .env.example .env
+
+# 编辑 .env 文件，填入你的API密钥
+# Edit .env file and fill in your API keys
+# 必需配置:
+# - OPENAI_API_KEY: 你的API密钥（OpenAI或其他兼容服务的密钥）
+# Required configuration:
+# - OPENAI_API_KEY: Your API key (OpenAI or other compatible service)
+```
+
+#### 自定义API Endpoint (Custom API Endpoint)
+
+项目支持使用自定义API endpoint，允许您使用：
+- 本地部署的模型（如vLLM、llama.cpp等）
+- Azure OpenAI服务
+- 其他兼容OpenAI API的服务
+
+**配置方法**:
+```bash
+# 在 .env 文件中设置
+OPENAI_API_BASE=http://localhost:8000/v1  # 本地模型
+# 或
+OPENAI_API_BASE=https://YOUR_RESOURCE.openai.azure.com/  # Azure OpenAI
+# 或留空使用默认OpenAI API
+```
+
+**支持的endpoint格式**:
+- 本地模型: `http://localhost:8000/v1`
+- Azure OpenAI: `https://YOUR_RESOURCE.openai.azure.com/`
+- 其他兼容服务: `https://api.example.com/v1`
+
+**重要提示**: 请确保在运行代码前已正确配置 `.env` 文件。项目会自动加载 `.env` 文件中的环境变量。如果设置了 `OPENAI_API_BASE`，将使用自定义endpoint；否则使用默认的OpenAI API。
+
+**Important**: Make sure to configure the `.env` file correctly before running the code. The project will automatically load environment variables from the `.env` file. If `OPENAI_API_BASE` is set, it will use the custom endpoint; otherwise, it will use the default OpenAI API.
 
 ## 📚 Features (功能特性)
 
@@ -155,6 +226,32 @@ This **ReAct PubMed Agent** is not just a "chatbot" - it's a **scientific intell
 - 🌏 **Multi-language support** for broader accessibility (多语言支持)
 
 **You're not just training models—you're orchestrating intelligence!** (您不是在训练模型——您在编排智能！) 🚀
+
+## 🖥️ 命令行使用 (Command Line Usage)
+
+项目提供了完整的命令行接口，可以直接从终端使用：
+
+The project provides a complete command-line interface:
+
+```bash
+# 基本查询 / Basic query
+pubmed-agent query "mRNA疫苗的作用机制是什么？"
+
+# 交互式模式 / Interactive mode
+pubmed-agent interactive
+
+# 搜索文献 / Search articles
+pubmed-agent search "COVID-19 vaccine" --max-results 5
+
+# 查看统计信息 / View statistics
+pubmed-agent stats
+```
+
+**详细文档**: 查看 [CLI_USAGE.md](CLI_USAGE.md) 获取完整的命令行使用指南。
+
+**Documentation**: See [CLI_USAGE.md](CLI_USAGE.md) for complete CLI usage guide.
+
+---
 
 ## 📋 Usage Examples (使用示例)
 

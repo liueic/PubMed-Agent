@@ -7,6 +7,20 @@ import os
 from typing import Optional
 from pydantic import BaseModel
 
+# Auto-load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    # Load .env file from project root
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.env')
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
+    else:
+        # Also try loading from current directory
+        load_dotenv()
+except ImportError:
+    # python-dotenv not installed, skip auto-loading
+    pass
+
 
 class AgentConfig(BaseModel):
     """
@@ -23,6 +37,7 @@ class AgentConfig(BaseModel):
         # Load from environment variables first
         env_values = {}
         env_values["openai_api_key"] = os.getenv("OPENAI_API_KEY")
+        env_values["openai_api_base"] = os.getenv("OPENAI_API_BASE")  # 支持自定义endpoint
         env_values["openai_model"] = os.getenv("OPENAI_MODEL", "gpt-4o")
         env_values["vector_db_type"] = os.getenv("VECTOR_DB_TYPE", "chroma")
         env_values["chroma_persist_directory"] = os.getenv("CHROMA_PERSIST_DIRECTORY", "./data/chroma")
@@ -49,6 +64,7 @@ class AgentConfig(BaseModel):
     
     # Runtime attributes (declared for Pydantic)
     openai_api_key: str = ""
+    openai_api_base: Optional[str] = None  # 自定义API endpoint，None表示使用默认OpenAI API
     openai_model: str = "gpt-4o"
     vector_db_type: str = "chroma"
     chroma_persist_directory: str = "./data/chroma"
