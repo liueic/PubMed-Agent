@@ -4,7 +4,8 @@ Phase 1: Basic infrastructure - Tool system.
 """
 
 import logging
-from typing import List, Optional
+import json
+from typing import List, Optional, Dict, Any
 from langchain.tools import BaseTool
 from langchain_core.tools import tool
 from .config import AgentConfig
@@ -12,6 +13,173 @@ from .vector_db import create_vector_db, get_collection_name
 from .utils import chunk_text, PubMedRateLimiter, parse_pubmed_date
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_pubmed_article_xml(article_elem) -> Optional[Dict[str, Any]]:
+    """
+    从XML元素中解析PubMed文章信息。
+    这是一个辅助函数，用于复用文章解析逻辑。
+    
+    Args:
+        article_elem: XML元素，包含PubmedArticle数据
+        
+    Returns:
+        包含文章信息的字典，如果解析失败则返回None
+    """
+    try:
+        # 提取 PMID
+        pmid_elem = article_elem.find(".//PMID")
+        pmid = pmid_elem.text if pmid_elem is not None else "Unknown"
+        
+        # 提取标题
+        title_elem = article_elem.find(".//ArticleTitle")
+        title = title_elem.text if title_elem is not None else "No title"
+        
+        # 提取完整作者列表
+        authors = []
+        author_list = article_elem.find(".//AuthorList")
+        if author_list is not None:
+            for author in author_list:
+                last_name = author.find("LastName")
+                first_name = author.find("ForeName")
+                initials = author.find("Initials")
+                if last_name is not None and last_name.text:
+                    author_name = last_name.text
+                    if first_name is not None and first_name.text:
+                        author_name += f" {first_name.text}"
+                    elif initials is not None and initials.text:
+                        author_name += f" {initials.text}"
+                    authors.append(author_name)
+        
+        # 提取期刊信息
+        journal_elem = article_elem.find(".//Journal/Title")
+        journal = journal_elem.text if journal_elem is not None else "Unknown journal"
+        
+        # 提取期刊ISO缩写
+        journal_iso = article_elem.find(".//Journal/ISOAbbreviation")
+        journal_iso_text = journal_iso.text if journal_iso is not None else None
+        
+        # 提取更详细的出版日期
+        pub_date_elem = article_elem.find(".//PubDate")
+        pub_year = "Unknown"
+        pub_month = ""
+        pub_day = ""
+        if pub_date_elem is not None:
+            year_elem = pub_date_elem.find("Year")
+            month_elem = pub_date_elem.find("Month")
+            day_elem = pub_date_elem.find("Day")
+            if year_elem is not None:
+                pub_year = year_elem.text
+            if month_elem is not None:
+                pub_month = month_elem.text
+            if day_elem is not None:
+                pub_day = day_elem.text
+        
+        # 构建完整的出版日期字符串
+        pub_date_parts = [pub_year]
+        if pub_month:
+            pub_date_parts.append(pub_month)
+        if pub_day:
+            pub_date_parts.append(pub_day)
+        publication_date = "-".join(pub_date_parts) if pub_date_parts else "Unknown"
+        
+        # 提取卷号、期号、页码
+        volume_elem = article_elem.find(".//JournalIssue/Volume")
+        issue_elem = article_elem.find(".//JournalIssue/Issue")
+        pagination_elem = article_elem.find(".//Pagination/MedlinePgn")
+        volume = volume_elem.text if volume_elem is not None else None
+        issue = issue_elem.text if issue_elem is not None else None
+        pages = pagination_elem.text if pagination_elem is not None else None
+        
+        # 提取完整摘要（支持多个AbstractText部分）
+        abstract_parts = []
+        abstract_elem_list = article_elem.findall(".//Abstract/AbstractText")
+        if abstract_elem_list:
+            for abs_elem in abstract_elem_list:
+                if abs_elem.text:
+                    # 检查是否有Label属性（如Background, Methods, Results, Conclusion）
+                    label = abs_elem.get("Label", "")
+                    text = abs_elem.text.strip()
+                    if label:
+                        abstract_parts.append(f"{label}: {text}")
+                    else:
+                        abstract_parts.append(text)
+        # 如果没有结构化摘要，尝试获取简单的AbstractText
+        if not abstract_parts:
+            simple_abstract = article_elem.find(".//AbstractText")
+            if simple_abstract is not None and simple_abstract.text:
+                abstract_parts.append(simple_abstract.text.strip())
+        
+        abstract = " ".join(abstract_parts) if abstract_parts else ""
+        
+        # 提取DOI
+        doi = None
+        article_id_list = article_elem.findall(".//ArticleIdList/ArticleId")
+        for article_id in article_id_list:
+            if article_id.get("IdType") == "doi":
+                doi = article_id.text
+                break
+        
+        # 提取PMC ID（如果可用）
+        pmc_id = None
+        for article_id in article_id_list:
+            if article_id.get("IdType") == "pmc":
+                pmc_id = article_id.text
+                break
+        
+        # 提取MeSH术语
+        mesh_terms = []
+        mesh_list = article_elem.findall(".//MeshHeadingList/MeshHeading")
+        for mesh_heading in mesh_list:
+            descriptor = mesh_heading.find("DescriptorName")
+            if descriptor is not None and descriptor.text:
+                mesh_terms.append(descriptor.text)
+        
+        # 提取关键词（如果可用）
+        keywords = []
+        keyword_list = article_elem.findall(".//KeywordList/Keyword")
+        for keyword in keyword_list:
+            if keyword.text:
+                keywords.append(keyword.text)
+        
+        # 提取文章类型
+        publication_types = []
+        pub_type_list = article_elem.findall(".//PublicationTypeList/PublicationType")
+        for pub_type in pub_type_list:
+            if pub_type.text:
+                publication_types.append(pub_type.text)
+        
+        # 提取语言
+        language_list = article_elem.findall(".//Language")
+        languages = [lang.text for lang in language_list if lang.text]
+        language = languages[0] if languages else "Unknown"
+        
+        # 构建文章信息字典
+        article_info = {
+            "pmid": pmid,
+            "title": title,
+            "authors": authors,
+            "journal": journal,
+            "journal_iso": journal_iso_text,
+            "publication_date": publication_date,
+            "year": pub_year,
+            "volume": volume,
+            "issue": issue,
+            "pages": pages,
+            "abstract": abstract,
+            "doi": doi,
+            "pmc_id": pmc_id,
+            "mesh_terms": mesh_terms,
+            "keywords": keywords,
+            "publication_types": publication_types,
+            "language": language
+        }
+        
+        return article_info
+        
+    except Exception as e:
+        logger.warning(f"Error parsing article XML: {e}", exc_info=True)
+        return None
 
 
 class PubMedSearchTool(BaseTool):
@@ -143,161 +311,12 @@ class PubMedSearchTool(BaseTool):
             # 提取文章信息（增强版，提取更全面的字段）
             articles = []
             for article in root.findall(".//PubmedArticle"):
-                try:
-                    # 提取 PMID
-                    pmid_elem = article.find(".//PMID")
-                    pmid = pmid_elem.text if pmid_elem is not None else "Unknown"
-                    
-                    # 提取标题
-                    title_elem = article.find(".//ArticleTitle")
-                    title = title_elem.text if title_elem is not None else "No title"
-                    
-                    # 提取完整作者列表（不再限制为前3个）
-                    authors = []
-                    author_list = article.find(".//AuthorList")
-                    if author_list is not None:
-                        for author in author_list:
-                            last_name = author.find("LastName")
-                            first_name = author.find("ForeName")
-                            initials = author.find("Initials")
-                            if last_name is not None and last_name.text:
-                                author_name = last_name.text
-                                if first_name is not None and first_name.text:
-                                    author_name += f" {first_name.text}"
-                                elif initials is not None and initials.text:
-                                    author_name += f" {initials.text}"
-                                authors.append(author_name)
-                    
-                    # 提取期刊信息
-                    journal_elem = article.find(".//Journal/Title")
-                    journal = journal_elem.text if journal_elem is not None else "Unknown journal"
-                    
-                    # 提取期刊ISO缩写
-                    journal_iso = article.find(".//Journal/ISOAbbreviation")
-                    journal_iso_text = journal_iso.text if journal_iso is not None else None
-                    
-                    # 提取更详细的出版日期
-                    pub_date_elem = article.find(".//PubDate")
-                    pub_year = "Unknown"
-                    pub_month = ""
-                    pub_day = ""
-                    if pub_date_elem is not None:
-                        year_elem = pub_date_elem.find("Year")
-                        month_elem = pub_date_elem.find("Month")
-                        day_elem = pub_date_elem.find("Day")
-                        if year_elem is not None:
-                            pub_year = year_elem.text
-                        if month_elem is not None:
-                            pub_month = month_elem.text
-                        if day_elem is not None:
-                            pub_day = day_elem.text
-                    
-                    # 构建完整的出版日期字符串
-                    pub_date_parts = [pub_year]
-                    if pub_month:
-                        pub_date_parts.append(pub_month)
-                    if pub_day:
-                        pub_date_parts.append(pub_day)
-                    publication_date = "-".join(pub_date_parts) if pub_date_parts else "Unknown"
-                    
-                    # 提取卷号、期号、页码
-                    volume_elem = article.find(".//JournalIssue/Volume")
-                    issue_elem = article.find(".//JournalIssue/Issue")
-                    pagination_elem = article.find(".//Pagination/MedlinePgn")
-                    volume = volume_elem.text if volume_elem is not None else None
-                    issue = issue_elem.text if issue_elem is not None else None
-                    pages = pagination_elem.text if pagination_elem is not None else None
-                    
-                    # 提取完整摘要（支持多个AbstractText部分）
-                    abstract_parts = []
-                    abstract_elem_list = article.findall(".//Abstract/AbstractText")
-                    if abstract_elem_list:
-                        for abs_elem in abstract_elem_list:
-                            if abs_elem.text:
-                                # 检查是否有Label属性（如Background, Methods, Results, Conclusion）
-                                label = abs_elem.get("Label", "")
-                                text = abs_elem.text.strip()
-                                if label:
-                                    abstract_parts.append(f"{label}: {text}")
-                                else:
-                                    abstract_parts.append(text)
-                    # 如果没有结构化摘要，尝试获取简单的AbstractText
-                    if not abstract_parts:
-                        simple_abstract = article.find(".//AbstractText")
-                        if simple_abstract is not None and simple_abstract.text:
-                            abstract_parts.append(simple_abstract.text.strip())
-                    
-                    abstract = " ".join(abstract_parts) if abstract_parts else ""
-                    
-                    # 提取DOI
-                    doi = None
-                    article_id_list = article.findall(".//ArticleIdList/ArticleId")
-                    for article_id in article_id_list:
-                        if article_id.get("IdType") == "doi":
-                            doi = article_id.text
-                            break
-                    
-                    # 提取PMC ID（如果可用）
-                    pmc_id = None
-                    for article_id in article_id_list:
-                        if article_id.get("IdType") == "pmc":
-                            pmc_id = article_id.text
-                            break
-                    
-                    # 提取MeSH术语
-                    mesh_terms = []
-                    mesh_list = article.findall(".//MeshHeadingList/MeshHeading")
-                    for mesh_heading in mesh_list:
-                        descriptor = mesh_heading.find("DescriptorName")
-                        if descriptor is not None and descriptor.text:
-                            mesh_terms.append(descriptor.text)
-                    
-                    # 提取关键词（如果可用）
-                    keywords = []
-                    keyword_list = article.findall(".//KeywordList/Keyword")
-                    for keyword in keyword_list:
-                        if keyword.text:
-                            keywords.append(keyword.text)
-                    
-                    # 提取文章类型
-                    publication_types = []
-                    pub_type_list = article.findall(".//PublicationTypeList/PublicationType")
-                    for pub_type in pub_type_list:
-                        if pub_type.text:
-                            publication_types.append(pub_type.text)
-                    
-                    # 提取语言
-                    language_list = article.findall(".//Language")
-                    languages = [lang.text for lang in language_list if lang.text]
-                    language = languages[0] if languages else "Unknown"
-                    
-                    # 构建文章信息字典
-                    article_info = {
-                        "pmid": pmid,
-                        "title": title,
-                        "authors": authors,
-                        "author_count": len(authors),
-                        "journal": journal,
-                        "journal_iso": journal_iso_text,
-                        "publication_date": publication_date,
-                        "year": pub_year,
-                        "volume": volume,
-                        "issue": issue,
-                        "pages": pages,
-                        "abstract": abstract,
-                        "abstract_length": len(abstract),
-                        "doi": doi,
-                        "pmc_id": pmc_id,
-                        "mesh_terms": mesh_terms,
-                        "keywords": keywords,
-                        "publication_types": publication_types,
-                        "language": language
-                    }
-                    
+                article_info = _parse_pubmed_article_xml(article)
+                if article_info:
+                    # 添加额外的字段用于格式化输出
+                    article_info["author_count"] = len(article_info.get("authors", []))
+                    article_info["abstract_length"] = len(article_info.get("abstract", ""))
                     articles.append(article_info)
-                except Exception as e:
-                    logger.warning(f"Error parsing article: {e}", exc_info=True)
-                    continue
             
             # 格式化输出（增强版，展示更全面的信息）
             if not articles:
@@ -390,6 +409,158 @@ class PubMedSearchTool(BaseTool):
     async def _arun(self, query: str) -> str:
         """Async version of PubMed search."""
         return self._run(query)
+
+
+class PubMedFetchTool(BaseTool):
+    """Tool for fetching a single article by PMID."""
+    
+    name: str = "pubmed_fetch"
+    description: str = (
+        "Fetch a single article from PubMed by its PMID (PubMed ID). "
+        "Input should be a PMID string (e.g., '12345678'). "
+        "Returns JSON-formatted article data that can be directly stored using vector_store tool. "
+        "Use this tool when you have a specific PMID and need to retrieve the full article details."
+    )
+    
+    # 使用类级别的变量存储配置和速率限制器
+    _config: Optional[AgentConfig] = None
+    _rate_limiter = None
+    
+    def __init__(self, config: Optional[AgentConfig] = None, **kwargs):
+        """Initialize the PubMed fetch tool."""
+        super().__init__(**kwargs)
+        # 使用私有属性存储，避免Pydantic验证错误
+        object.__setattr__(self, '_config', config or AgentConfig())
+        object.__setattr__(self, '_rate_limiter', PubMedRateLimiter(requests_per_second=3.0))
+    
+    @property
+    def config(self) -> AgentConfig:
+        """Get the configuration."""
+        return self._config
+    
+    def _run(self, pmid: str) -> str:
+        """
+        Execute PubMed fetch by PMID.
+        
+        Args:
+            pmid: PubMed ID (PMID) as a string
+            
+        Returns:
+            JSON-formatted string containing article data, or error message
+        """
+        try:
+            # 导入 Bio.Entrez（延迟导入，避免在模块级别导入）
+            try:
+                from Bio import Entrez
+                from xml.etree import ElementTree as ET
+            except ImportError:
+                logger.error("Bio.Entrez is not available. Please install biopython: pip install biopython")
+                return json.dumps({
+                    "error": "biopython is required for PubMed fetch. Please install it: pip install biopython"
+                })
+            
+            # 清理PMID输入（移除可能的空格和非数字字符）
+            pmid = str(pmid).strip()
+            # 移除常见的PMID前缀（如"PMID:"）
+            if pmid.upper().startswith("PMID:"):
+                pmid = pmid[5:].strip()
+            
+            # 验证PMID格式（应该是1-8位数字）
+            if not pmid.isdigit() or len(pmid) > 8:
+                error_msg = f"Invalid PMID format: {pmid}. PMID should be 1-8 digits."
+                logger.warning(error_msg)
+                return json.dumps({"error": error_msg, "pmid": pmid})
+            
+            # 设置 NCBI Entrez 参数
+            if self.config.pubmed_email:
+                email = self.config.pubmed_email.strip()
+                if email == "pubmed_agent@example.com" or "@example.com" in email.lower():
+                    logger.warning(
+                        "⚠️  检测到使用了示例邮箱地址。NCBI要求提供真实的email地址。"
+                        "请设置环境变量 PUBMED_EMAIL 或在配置中提供您的真实邮箱。"
+                    )
+                Entrez.email = email
+            else:
+                default_email = "pubmed_agent@example.com"
+                logger.warning(
+                    "警告：未配置 PUBMED_EMAIL 环境变量。"
+                    "NCBI要求提供真实的email地址以符合使用政策。"
+                )
+                Entrez.email = default_email
+            
+            if self.config.pubmed_tool_name:
+                Entrez.tool = self.config.pubmed_tool_name
+            else:
+                Entrez.tool = "pubmed_agent"
+            
+            # 设置API key（可选，但强烈推荐以提升速率限制）
+            if self.config.pubmed_api_key:
+                Entrez.api_key = self.config.pubmed_api_key.strip()
+                logger.info("✅ 已配置PubMed API Key，速率限制已提升（10次/秒）")
+            else:
+                logger.debug("未配置 PUBMED_API_KEY，当前速率限制为3次/秒")
+            
+            # 使用速率限制器
+            self._rate_limiter.wait_if_needed()
+            
+            # 使用 efetch 获取文章详情
+            logger.info(f"Fetching article with PMID: {pmid}")
+            fetch_handle = Entrez.efetch(
+                db="pubmed",
+                id=pmid,
+                rettype="medline",  # 使用medline格式获取更全面的元数据
+                retmode="xml"
+            )
+            
+            # 解析 XML
+            try:
+                xml_data = fetch_handle.read()
+                fetch_handle.close()
+                
+                root = ET.fromstring(xml_data)
+            except ET.ParseError as e:
+                error_msg = f"Error parsing XML response for PMID {pmid}: {e}"
+                logger.error(error_msg)
+                return json.dumps({"error": error_msg, "pmid": pmid})
+            
+            # 查找文章元素
+            articles = root.findall(".//PubmedArticle")
+            
+            if not articles:
+                # 检查是否有错误信息
+                error_elements = root.findall(".//ERROR")
+                if error_elements:
+                    error_text = error_elements[0].text if error_elements[0].text else "Unknown error"
+                    error_msg = f"PubMed API error for PMID {pmid}: {error_text}"
+                    logger.error(error_msg)
+                    return json.dumps({"error": error_msg, "pmid": pmid})
+                
+                # 没有找到文章
+                error_msg = f"Article with PMID {pmid} not found in PubMed database."
+                logger.warning(error_msg)
+                return json.dumps({"error": error_msg, "pmid": pmid})
+            
+            # 解析第一篇文章（应该只有一篇）
+            article_elem = articles[0]
+            article_info = _parse_pubmed_article_xml(article_elem)
+            
+            if not article_info:
+                error_msg = f"Failed to parse article data for PMID {pmid}"
+                logger.error(error_msg)
+                return json.dumps({"error": error_msg, "pmid": pmid})
+            
+            # 返回JSON格式的文章数据
+            logger.info(f"Successfully fetched article: {article_info.get('title', 'Unknown')[:50]}...")
+            return json.dumps(article_info, ensure_ascii=False, indent=2)
+            
+        except Exception as e:
+            error_msg = f"Error fetching article from PubMed: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            return json.dumps({"error": error_msg, "pmid": pmid if 'pmid' in locals() else "unknown"})
+    
+    async def _arun(self, pmid: str) -> str:
+        """Async version of PubMed fetch."""
+        return self._run(pmid)
 
 
 class VectorDBStoreTool(BaseTool):
@@ -682,6 +853,7 @@ def create_tools(config: AgentConfig, thread_id_getter=None) -> List[BaseTool]:
     """
     return [
         PubMedSearchTool(config=config),
+        PubMedFetchTool(config=config),
         VectorDBStoreTool(config=config, thread_id_getter=thread_id_getter),
         VectorSearchTool(config=config, thread_id_getter=thread_id_getter)
     ]

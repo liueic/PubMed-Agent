@@ -62,6 +62,7 @@ except ImportError:
 from .config import AgentConfig
 from .tools import create_tools
 from .prompts import get_optimized_prompt, get_chinese_templates, get_english_templates
+from .utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -869,6 +870,14 @@ class PubMedAgent:
         """
         self.config = config or AgentConfig()
         self.language = language
+        
+        # 初始化日志系统（如果尚未初始化）
+        if not logging.getLogger().handlers:
+            setup_logging(
+                log_level=self.config.log_level,
+                log_file=self.config.log_file,  # 使用配置中的日志文件路径
+                detailed=False
+            )
         
         # Thread ID management for vector database isolation
         self._current_thread_id: Optional[str] = None

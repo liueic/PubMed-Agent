@@ -54,6 +54,7 @@ class AgentConfig(BaseModel):
         env_values["chunk_overlap"] = int(os.getenv("CHUNK_OVERLAP", "200"))
         env_values["temperature"] = float(os.getenv("TEMPERATURE", "0.0"))
         env_values["log_level"] = os.getenv("LOG_LEVEL", "INFO")
+        env_values["log_file"] = os.getenv("LOG_FILE")  # 可选，如果未设置则为None
         
         # Override with explicit kwargs
         env_values.update(kwargs)
@@ -109,3 +110,4 @@ class AgentConfig(BaseModel):
     chunk_overlap: int = 200
     temperature: float = 0.0
     log_level: str = "INFO"
+    log_file: Optional[str] = None  # 日志文件路径，如果为None则不写入文件
