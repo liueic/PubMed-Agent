@@ -874,6 +874,9 @@ class PubMedAgent:
         self._current_thread_id: Optional[str] = None
         self._thread_id_getter: Optional[Callable[[], Optional[str]]] = None
         
+        # Session management for multi-turn conversations
+        self._session_thread_id: Optional[str] = None
+        
         # Initialize LLM with controlled temperature for factual responses
         # Support custom API endpoint for compatibility with OpenAI-compatible APIs
         llm_kwargs = {
@@ -1158,37 +1161,74 @@ class PubMedAgent:
             
             return agent_executor
     
-    def query(self, question: str, prompt_type: Optional[str] = None, language: Optional[str] = None) -> Dict[str, Any]:
+    def start_new_session(self) -> str:
+        """
+        Start a new conversation session.
+        
+        Generates a new thread_id for the session, which will be used for all subsequent
+        queries until a new session is started. This allows maintaining conversation context
+        across multiple queries in the same session.
+        
+        Returns:
+            The new session thread_id
+        """
+        self._session_thread_id = str(uuid.uuid4())
+        logger.info(f"Started new session with thread_id: {self._session_thread_id}")
+        return self._session_thread_id
+    
+    def get_current_session_id(self) -> Optional[str]:
+        """
+        Get the current session thread_id.
+        
+        Returns:
+            The current session thread_id, or None if no session has been started
+        """
+        return self._session_thread_id
+    
+    def query(self, question: str, prompt_type: Optional[str] = None, language: Optional[str] = None, thread_id: Optional[str] = None, new_session: bool = False) -> Dict[str, Any]:
         """
         Query the agent with a scientific question.
         
         Phase 4: Programmable thinking process - Query-aware prompt selection.
-        Enhanced with Chinese language support.
+        Enhanced with Chinese language support and multi-turn conversation support.
         
         Args:
             question: The scientific question to answer
             prompt_type: Optional prompt type override. If None, auto-classifies.
             language: Language override ("en", "zh"). If None, uses instance default.
+            thread_id: Optional explicit thread_id to use. If provided, this thread_id will be used
+                       and the session will be updated to use this thread_id.
+            new_session: If True, start a new conversation session. Defaults to False.
         
         Returns:
-            Dictionary containing the answer and metadata
+            Dictionary containing the answer and metadata, including the thread_id used
         """
         try:
             logger.info(f"Processing query: {question}")
             
-            # Generate or get thread_id for vector database isolation
-            # 对于LangChain 1.0+，可以从config中获取thread_id；否则生成新的UUID
-            if LANGCHAIN_VERSION == "1.0+":
-                # 在LangChain 1.0+中，每个query都会生成新的thread_id
-                # 使用UUID生成唯一的thread_id
-                thread_id = str(uuid.uuid4())
+            # Session management: determine thread_id for this query
+            # Priority: 1. explicit thread_id parameter, 2. new_session flag, 3. existing session, 4. create new
+            if thread_id is not None:
+                # Use explicitly provided thread_id and update session
+                self._session_thread_id = thread_id
+                thread_id_to_use = thread_id
+                logger.info(f"Using explicit thread_id: {thread_id_to_use}")
+            elif new_session:
+                # Start a new session
+                thread_id_to_use = self.start_new_session()
+                logger.info(f"Started new session with thread_id: {thread_id_to_use}")
+            elif self._session_thread_id is not None:
+                # Reuse existing session
+                thread_id_to_use = self._session_thread_id
+                logger.info(f"Reusing existing session with thread_id: {thread_id_to_use}")
             else:
-                # LangChain 0.x中，如果没有指定thread_id，生成新的UUID
-                thread_id = str(uuid.uuid4())
+                # No session exists, create one
+                thread_id_to_use = self.start_new_session()
+                logger.info(f"Created new session with thread_id: {thread_id_to_use}")
             
             # 设置当前thread_id，工具会通过thread_id_getter获取
-            self._current_thread_id = thread_id
-            logger.info(f"Using thread_id for vector database isolation: {thread_id}")
+            self._current_thread_id = thread_id_to_use
+            logger.info(f"Using thread_id for vector database isolation: {thread_id_to_use}")
             
             # Determine language for this query
             query_language = language or self.language
@@ -1211,8 +1251,8 @@ class PubMedAgent:
                 from langchain_core.messages import HumanMessage
                 config = {}
                 if self.memory:
-                    # 使用生成的thread_id，而不是"default"
-                    config = {"configurable": {"thread_id": thread_id}}
+                    # 使用会话的thread_id，保持对话上下文
+                    config = {"configurable": {"thread_id": thread_id_to_use}}
                 
                 # Invoke with messages format
                 result = self.agent_executor.invoke(
@@ -1282,7 +1322,7 @@ class PubMedAgent:
                 "intermediate_steps": result.get("intermediate_steps", []) if isinstance(result, dict) else [],
                 "prompt_type": prompt_type,
                 "language": query_language,
-                "thread_id": thread_id,  # 添加thread_id信息
+                "thread_id": thread_id_to_use,  # 使用会话的thread_id
                 "success": True
             }
             

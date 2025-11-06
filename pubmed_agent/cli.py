@@ -170,11 +170,18 @@ def interactive_command(args):
         # 创建agent
         agent = PubMedAgent(config=config, language=args.language)
         
+        # 开始新的对话会话，保持多轮对话上下文
+        session_id = agent.start_new_session()
+        
         print("🧬 ReAct PubMed Agent - 交互式模式 / Interactive Mode")
         print("=" * 80)
         print("输入您的问题，输入 'quit' 或 'exit' 退出")
+        print("输入 'new' 或 '/new' 开始新会话")
         print("Enter your question, type 'quit' or 'exit' to exit")
+        print("Type 'new' or '/new' to start a new session")
         print("=" * 80)
+        if args.verbose:
+            print(f"会话ID / Session ID: {session_id}")
         print()
         
         while True:
@@ -188,6 +195,15 @@ def interactive_command(args):
                 if query.lower() in ['quit', 'exit', 'q', '退出']:
                     print("\n👋 再见 / Goodbye!")
                     break
+                
+                # 处理新会话命令
+                if query.lower() in ['new', '/new']:
+                    session_id = agent.start_new_session()
+                    print(f"\n✅ 已开始新会话 / New session started")
+                    if args.verbose:
+                        print(f"会话ID / Session ID: {session_id}")
+                    print()
+                    continue
                 
                 # 执行查询
                 print("\n🔍 正在处理 / Processing...")
