@@ -23,7 +23,39 @@ from .config import AgentConfig
 def print_response(response: dict, verbose: bool = False):
     """格式化打印响应"""
     if not response.get('success', False):
-        print(f"❌ 错误 / Error: {response.get('error', 'Unknown error')}")
+        error_msg = response.get('error', 'Unknown error')
+        error_details = response.get('error_details', {})
+        
+        print("\n" + "=" * 80)
+        print("❌ 错误 / Error")
+        print("=" * 80)
+        
+        # 显示错误消息（可能包含详细建议）
+        answer = response.get('answer', error_msg)
+        print(answer)
+        
+        # 在verbose模式下显示详细错误信息
+        if verbose:
+            print("\n" + "-" * 80)
+            print("🔍 详细错误信息 / Detailed Error Information:")
+            print("-" * 80)
+            print(f"错误类型 / Error Type: {error_details.get('type', 'Unknown')}")
+            print(f"错误消息 / Error Message: {error_msg}")
+            
+            if error_details.get('status_code'):
+                print(f"HTTP状态码 / HTTP Status Code: {error_details['status_code']}")
+            
+            if error_details.get('request_url'):
+                print(f"请求URL / Request URL: {error_details['request_url']}")
+            
+            if error_details.get('response_body'):
+                print(f"响应内容 / Response Body: {error_details['response_body'][:500]}")
+            
+            if error_details.get('details'):
+                print(f"\n详细建议 / Detailed Suggestions:")
+                print(error_details['details'])
+        
+        print("=" * 80)
         return
     
     print("\n" + "=" * 80)
@@ -159,8 +191,16 @@ def interactive_command(args):
                 
                 # 执行查询
                 print("\n🔍 正在处理 / Processing...")
-                response = agent.query(query)
-                print_response(response, verbose=args.verbose)
+                try:
+                    response = agent.query(query)
+                    print_response(response, verbose=args.verbose)
+                except Exception as e:
+                    # 如果query方法本身抛出异常（而不是返回错误响应）
+                    print(f"❌ 错误 / Error: {str(e)}")
+                    if args.verbose:
+                        import traceback
+                        print("\n详细堆栈信息 / Detailed Traceback:")
+                        traceback.print_exc()
                 print()
                 
             except KeyboardInterrupt:
