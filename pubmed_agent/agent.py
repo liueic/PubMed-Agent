@@ -300,6 +300,201 @@ def _recursive_parse_json(value, max_depth=5):
         return value
 
 
+def _extract_and_fix_tool_calls_from_error(error_str, messages):
+    """
+    从 Pydantic 验证错误信息中提取 tool_calls 数据并修复消息历史。
+    
+    当 LangChain 在创建 AIMessage 时遇到验证错误（tool_calls.0.args 是字符串而不是字典），
+    此函数会从错误信息中提取所有 args 字符串，解析为字典，并修复消息历史中最后一条 AIMessage。
+    支持处理多个 tool_calls 的情况。
+    
+    Args:
+        error_str: 错误信息字符串
+        messages: 当前的消息历史列表
+        
+    Returns:
+        修复后的消息列表，如果无法修复则返回 None
+    """
+    import re
+    from langchain_core.messages import AIMessage
+    
+    try:
+        # 从错误信息中提取所有 tool_calls 的错误信息
+        # 错误格式可能包含多个: tool_calls.0.args, tool_calls.1.args 等
+        # 每个错误都有: Input should be a valid dictionary [type=dict_type, input_value='{"pmid": "..."}', input_type=str]
+        
+        # 提取所有 tool_calls 索引和对应的 args 字符串
+        tool_call_fixes = {}  # {index: parsed_args_dict}
+        
+        # 匹配所有 tool_calls.X.args 错误
+        # 错误格式: tool_calls.0.args\n  Input should be a valid dictionary [type=dict_type, input_value='{"pmid": "..."}', input_type=str]
+        # 或者: tool_calls[0].args\n  Input should be a valid dictionary [type=dict_type, input_value='{"pmid": "..."}', input_type=str]
+        pattern = r"tool_calls[\[\.](\d+)[\]\.]args[\s\S]*?input_value='([^']+)'"
+        matches = re.findall(pattern, error_str, re.MULTILINE | re.DOTALL)
+        
+        if matches:
+            for index_str, args_str in matches:
+                index = int(index_str)
+                logger.info(f"Found tool_call[{index}] error, args: {args_str[:100]}...")
+                
+                # 解析 args 字符串为字典
+                parsed_args = _recursive_parse_json(args_str)
+                if isinstance(parsed_args, dict):
+                    tool_call_fixes[index] = parsed_args
+                    logger.info(f"Successfully parsed tool_call[{index}] args: {list(parsed_args.keys())}")
+                else:
+                    logger.warning(f"Failed to parse tool_call[{index}] args as dict, got {type(parsed_args).__name__}")
+        
+        # 如果没有找到匹配的模式，尝试提取单个 args（向后兼容）
+        if not tool_call_fixes:
+            match = re.search(r"input_value='([^']+)'", error_str)
+            if match:
+                args_str = match.group(1)
+                logger.info(f"Extracted single args string from error: {args_str[:100]}...")
+                
+                parsed_args = _recursive_parse_json(args_str)
+                if isinstance(parsed_args, dict):
+                    # 尝试从错误信息中提取索引
+                    index_match = re.search(r"tool_calls[\[\.](\d+)", error_str)
+                    index = int(index_match.group(1)) if index_match else 0
+                    tool_call_fixes[index] = parsed_args
+                    logger.info(f"Successfully parsed args for tool_call[{index}]: {list(parsed_args.keys())}")
+        
+        # 即使从错误信息中提取失败，也尝试从消息历史中直接修复 tool_calls
+        # 因为错误信息中的 JSON 字符串可能被截断，但消息历史中可能包含完整的原始数据
+        if not tool_call_fixes:
+            logger.warning("Could not extract any tool_call args from error message, will try to fix from message history directly")
+        
+        # 查找所有包含 tool_calls 的消息并尝试修复（从后往前查找，优先修复最新的消息）
+        fixed_messages = list(messages)  # 创建副本
+        found_any_fix = False
+        
+        for i in range(len(fixed_messages) - 1, -1, -1):
+            msg = fixed_messages[i]
+            # 检查是否是 AIMessage 或包含 tool_calls
+            is_ai_message = isinstance(msg, AIMessage) or (
+                hasattr(msg, 'tool_calls') and msg.tool_calls
+            )
+            
+            if is_ai_message and hasattr(msg, 'tool_calls') and msg.tool_calls:
+                # 尝试修复这条消息的 tool_calls
+                fixed_tool_calls = []
+                found_problematic = False
+                
+                for idx, tc in enumerate(msg.tool_calls):
+                    # 如果这个索引在修复列表中，使用修复后的 args
+                    if idx in tool_call_fixes:
+                        parsed_args = tool_call_fixes[idx]
+                        if isinstance(tc, dict):
+                            tc_dict = tc.copy()
+                            # 如果 args 是字符串，使用解析后的字典
+                            if isinstance(tc_dict.get('args'), str):
+                                tc_dict['args'] = parsed_args
+                                fixed_tool_calls.append(tc_dict)
+                                found_problematic = True
+                                logger.info(f"Fixed tool_call[{idx}] args from string to dict (using error extraction)")
+                            else:
+                                fixed_tool_calls.append(tc_dict)
+                        elif hasattr(tc, 'args'):
+                            # 对象格式的 tool_call
+                            if isinstance(tc.args, str):
+                                tc_dict = {
+                                    'name': getattr(tc, 'name', ''),
+                                    'args': parsed_args,
+                                    'id': getattr(tc, 'id', ''),
+                                    'type': getattr(tc, 'type', 'tool_call')
+                                }
+                                fixed_tool_calls.append(tc_dict)
+                                found_problematic = True
+                                logger.info(f"Fixed tool_call[{idx}] args from string to dict (using error extraction)")
+                            else:
+                                # 保持原样，但转换为字典格式
+                                tc_dict = {
+                                    'name': getattr(tc, 'name', ''),
+                                    'args': getattr(tc, 'args', {}),
+                                    'id': getattr(tc, 'id', ''),
+                                    'type': getattr(tc, 'type', 'tool_call')
+                                }
+                                fixed_tool_calls.append(tc_dict)
+                        else:
+                            fixed_tool_calls.append(tc)
+                    else:
+                        # 其他 tool_call 保持不变，但确保是字典格式
+                        if isinstance(tc, dict):
+                            # 检查是否也需要修复（可能是字符串格式）
+                            tc_dict = tc.copy()
+                            if isinstance(tc_dict.get('args'), str):
+                                # 尝试解析并修复
+                                parsed = _recursive_parse_json(tc_dict['args'])
+                                if isinstance(parsed, dict):
+                                    tc_dict['args'] = parsed
+                                    found_problematic = True
+                                    logger.info(f"Fixed tool_call[{idx}] args from string to dict (not in error list)")
+                                else:
+                                    # 如果解析失败，但错误信息中提到了这个索引，尝试使用部分信息
+                                    # 或者保持原样，让后续的修复逻辑处理
+                                    logger.debug(f"Could not parse tool_call[{idx}] args, keeping original")
+                            fixed_tool_calls.append(tc_dict)
+                        else:
+                            # 对象格式的 tool_call，不在 tool_call_fixes 中
+                            # 检查 args 是否是字符串，如果是则尝试解析
+                            args = getattr(tc, 'args', {})
+                            if isinstance(args, str):
+                                parsed = _recursive_parse_json(args)
+                                if isinstance(parsed, dict):
+                                    args = parsed
+                                    found_problematic = True
+                                    logger.info(f"Fixed tool_call[{idx}] args from string to dict (object format, not in error list)")
+                                else:
+                                    logger.debug(f"Could not parse tool_call[{idx}] args (object format), keeping original")
+                            
+                            tc_dict = {
+                                'name': getattr(tc, 'name', ''),
+                                'args': args,
+                                'id': getattr(tc, 'id', ''),
+                                'type': getattr(tc, 'type', 'tool_call')
+                            }
+                            fixed_tool_calls.append(tc_dict)
+                
+                if found_problematic and fixed_tool_calls:
+                    # 创建新的 AIMessage 对象，使用修复后的 tool_calls
+                    try:
+                        # 获取消息的其他属性
+                        content = getattr(msg, 'content', '') or ''
+                        msg_id = getattr(msg, 'id', None)
+                        
+                        new_msg = AIMessage(
+                            content=content,
+                            tool_calls=fixed_tool_calls,
+                            id=msg_id
+                        )
+                        fixed_messages[i] = new_msg
+                        fixed_count = sum(1 for tc in fixed_tool_calls if isinstance(tc.get('args') if isinstance(tc, dict) else getattr(tc, 'args', None), dict))
+                        logger.info(f"Successfully fixed {fixed_count} tool_calls in message at index {i}")
+                        found_any_fix = True
+                        # 继续检查其他消息，不立即返回
+                    except Exception as e:
+                        logger.warning(f"Failed to create new AIMessage at index {i}: {e}")
+                        # 尝试直接修复原消息（如果可能）
+                        try:
+                            if hasattr(msg, 'tool_calls'):
+                                object.__setattr__(msg, 'tool_calls', fixed_tool_calls)
+                                logger.info(f"Fixed tool_calls in existing message at index {i}")
+                                found_any_fix = True
+                        except Exception as e2:
+                            logger.error(f"Failed to fix message directly at index {i}: {e2}")
+        
+        if found_any_fix:
+            logger.info("Successfully fixed tool_calls in at least one message")
+            return fixed_messages
+        
+        logger.warning("Could not find AIMessage with problematic tool_calls in message history")
+        return None
+    except Exception as e:
+        logger.error(f"Error extracting tool_calls from error: {e}", exc_info=True)
+        return None
+
+
 def _fix_tool_calls_args(message):
     """
     修复消息中 tool_calls 的 args 字段，将字符串格式的 args 转换为字典。
@@ -591,18 +786,181 @@ def _create_fix_tool_calls_wrapper(agent_executor, tools):
             error_str = str(e)
             if "tool_calls" in error_str and ("dict_type" in error_str or "Input should be a valid dictionary" in error_str):
                 logger.warning(f"Caught tool_calls validation error in agent_executor: {e}")
-                # 尝试从错误信息中提取tool_calls数据并修复
-                import re
-                # 查找所有tool_calls的args字符串
-                matches = re.findall(r"input_value='([^']+)'", error_str)
-                if matches:
-                    logger.info(f"Found {len(matches)} tool_call args in error message, attempting to fix...")
-                    # 尝试重新调用，但这次在LLM层面修复
-                    # 由于我们无法直接修改已经验证失败的消息，我们需要在下一轮修复
-                    # 但首先，让我们尝试修复输入，然后重试
-                    result = agent_executor.invoke(input_dict, config=config if config is not None else {})
+                
+                # 尝试从错误信息中提取并修复 tool_calls
+                if isinstance(input_dict, dict) and "messages" in input_dict:
+                    # 首先尝试从消息历史中修复
+                    fixed_messages = _extract_and_fix_tool_calls_from_error(error_str, input_dict["messages"])
+                    
+                    # 如果无法从消息历史中修复，尝试从错误信息中手动构造修复后的消息
+                    if not fixed_messages:
+                        try:
+                            # 从错误信息中提取所有 tool_calls 的信息
+                            import re
+                            import uuid
+                            from langchain_core.messages import AIMessage
+                            
+                            tool_call_fixes = {}
+                            pattern = r"tool_calls[\[\.](\d+)[\]\.]args[\s\S]*?input_value='([^']+)'"
+                            matches = re.findall(pattern, error_str, re.MULTILINE | re.DOTALL)
+                            
+                            if matches:
+                                for index_str, args_str in matches:
+                                    index = int(index_str)
+                                    parsed_args = _recursive_parse_json(args_str)
+                                    if isinstance(parsed_args, dict):
+                                        tool_call_fixes[index] = parsed_args
+                                        logger.info(f"Extracted tool_call[{index}] args from error: {list(parsed_args.keys())}")
+                                
+                                # 尝试从错误信息或消息历史中获取 tool_call 的其他信息（name, id）
+                                # 首先尝试从消息历史中查找最后一条消息
+                                fixed_tool_calls = []
+                                if input_dict.get("messages"):
+                                    # 从后往前查找，找到最后一条包含 tool_calls 的消息
+                                    last_msg_with_tool_calls = None
+                                    for msg in reversed(input_dict["messages"]):
+                                        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                                            last_msg_with_tool_calls = msg
+                                            break
+                                    
+                                    if last_msg_with_tool_calls and last_msg_with_tool_calls.tool_calls:
+                                        # 使用最后一条消息的 tool_calls 结构，但修复 args
+                                        for idx, tc in enumerate(last_msg_with_tool_calls.tool_calls):
+                                            if idx in tool_call_fixes:
+                                                if isinstance(tc, dict):
+                                                    tc_dict = tc.copy()
+                                                    tc_dict['args'] = tool_call_fixes[idx]
+                                                    fixed_tool_calls.append(tc_dict)
+                                                else:
+                                                    fixed_tool_calls.append({
+                                                        'name': getattr(tc, 'name', ''),
+                                                        'args': tool_call_fixes[idx],
+                                                        'id': getattr(tc, 'id', '') or f"call_{uuid.uuid4().hex[:8]}",
+                                                        'type': getattr(tc, 'type', 'tool_call')
+                                                    })
+                                            else:
+                                                # 保持原样，但确保是字典格式
+                                                if isinstance(tc, dict):
+                                                    fixed_tool_calls.append(tc)
+                                                else:
+                                                    fixed_tool_calls.append({
+                                                        'name': getattr(tc, 'name', ''),
+                                                        'args': getattr(tc, 'args', {}),
+                                                        'id': getattr(tc, 'id', ''),
+                                                        'type': getattr(tc, 'type', 'tool_call')
+                                                    })
+                                    
+                                    # 如果没有找到包含 tool_calls 的消息，尝试从工具列表中推断
+                                    if not fixed_tool_calls and tool_call_fixes:
+                                        logger.warning("Could not find message with tool_calls, attempting to infer from tools")
+                                        # 尝试从 args 中推断工具名称
+                                        for idx, parsed_args in tool_call_fixes.items():
+                                            # 尝试从工具列表中匹配（根据参数结构）
+                                            tool_name = None
+                                            
+                                            # 首先尝试从常见的参数名推断
+                                            if 'pmid' in parsed_args:
+                                                tool_name = 'pubmed_fetch'
+                                            elif 'query' in parsed_args:
+                                                tool_name = 'vector_store'
+                                            elif 'input_data' in parsed_args:
+                                                tool_name = 'vector_store'
+                                            else:
+                                                # 尝试从工具列表中匹配
+                                                for tool in tools:
+                                                    if hasattr(tool, 'args_schema'):
+                                                        try:
+                                                            # 检查工具的参数键是否与解析后的参数匹配
+                                                            schema = tool.args_schema
+                                                            if hasattr(schema, 'schema') and isinstance(schema.schema, dict):
+                                                                schema_props = schema.schema.get('properties', {})
+                                                                if set(parsed_args.keys()).issubset(set(schema_props.keys())):
+                                                                    tool_name = tool.name
+                                                                    break
+                                                        except:
+                                                            pass
+                                            
+                                            # 如果仍然无法推断，使用第一个工具或默认名称
+                                            if not tool_name:
+                                                tool_name = tools[0].name if tools else 'unknown_tool'
+                                            
+                                            fixed_tool_calls.append({
+                                                'name': tool_name,
+                                                'args': parsed_args,
+                                                'id': f"call_{uuid.uuid4().hex[:8]}",
+                                                'type': 'tool_call'
+                                            })
+                                            logger.info(f"Inferred tool name '{tool_name}' for tool_call[{idx}] with args keys: {list(parsed_args.keys())}")
+                                    
+                                    # 如果成功构造了 tool_calls，创建修复后的消息
+                                    if fixed_tool_calls:
+                                        # 尝试从最后一条消息获取 content
+                                        last_msg = input_dict["messages"][-1] if input_dict["messages"] else None
+                                        content = getattr(last_msg, 'content', '') or '' if last_msg else ''
+                                        
+                                        # 检查最后一条消息是否是 AIMessage（可能是部分创建的失败消息）
+                                        is_last_ai = isinstance(last_msg, AIMessage) if last_msg else False
+                                        
+                                        # 创建修复后的消息
+                                        fixed_msg = AIMessage(
+                                            content=content,
+                                            tool_calls=fixed_tool_calls,
+                                            id=getattr(last_msg, 'id', None) if last_msg else None
+                                        )
+                                        
+                                        # 根据最后一条消息的类型决定是替换还是添加
+                                        fixed_messages = list(input_dict["messages"])
+                                        if is_last_ai:
+                                            # 如果最后一条是 AIMessage（可能是失败的），替换它
+                                            fixed_messages[-1] = fixed_msg
+                                            logger.info(f"Replaced failed AIMessage with fixed message containing {len(fixed_tool_calls)} tool_calls")
+                                        else:
+                                            # 如果最后一条不是 AIMessage，添加新的消息
+                                            fixed_messages.append(fixed_msg)
+                                            logger.info(f"Added fixed AIMessage with {len(fixed_tool_calls)} tool_calls")
+                        except Exception as manual_fix_e:
+                            logger.warning(f"Could not manually fix from error: {manual_fix_e}", exc_info=True)
+                    
+                    # 如果仍然无法修复，尝试从 checkpointer 中获取最后的消息
+                    if not fixed_messages and config and isinstance(config, dict):
+                        try:
+                            # 尝试从 checkpointer 获取最后的消息
+                            checkpointer = config.get("configurable", {}).get("checkpoint_id")
+                            if not checkpointer and hasattr(agent_executor, 'checkpointer'):
+                                # 尝试从 agent_executor 获取 checkpointer
+                                checkpointer = agent_executor.checkpointer
+                            
+                            if checkpointer:
+                                # 尝试从 checkpointer 获取最后的消息
+                                # 注意：这可能需要根据实际的 checkpointer 实现来调整
+                                logger.info("Attempting to retrieve last message from checkpointer...")
+                        except Exception as checkpoint_e:
+                            logger.debug(f"Could not retrieve from checkpointer: {checkpoint_e}")
+                    
+                    if fixed_messages:
+                        logger.info("Successfully extracted and fixed tool_calls from error, retrying...")
+                        # 使用修复后的消息重试
+                        input_dict["messages"] = fixed_messages
+                        try:
+                            result = agent_executor.invoke(input_dict, config=config if config is not None else {})
+                        except Exception as retry_e:
+                            logger.error(f"Retry after fix still failed: {retry_e}")
+                            # 如果重试仍然失败，尝试最后一次修复
+                            error_str_retry = str(retry_e)
+                            if "tool_calls" in error_str_retry and ("dict_type" in error_str_retry or "Input should be a valid dictionary" in error_str_retry):
+                                fixed_messages_retry = _extract_and_fix_tool_calls_from_error(error_str_retry, input_dict["messages"])
+                                if fixed_messages_retry:
+                                    input_dict["messages"] = fixed_messages_retry
+                                    result = agent_executor.invoke(input_dict, config=config if config is not None else {})
+                                else:
+                                    raise e  # 抛出原始错误
+                            else:
+                                raise e  # 抛出原始错误
+                    else:
+                        logger.warning("Failed to extract tool_calls from error, re-raising original error")
+                        raise
                 else:
-                    # 如果无法提取，重新抛出错误
+                    logger.warning("Cannot fix error: input_dict does not contain messages")
                     raise
             else:
                 # 其他类型的错误，直接抛出
@@ -707,8 +1065,10 @@ def _create_fix_tool_calls_wrapper(agent_executor, tools):
                             else:
                                 # 如果解析失败，根据工具名称决定如何处理
                                 if tool_name == "vector_store":
-                                    # vector_store工具接受字符串参数（PMID），保持原样
-                                    pass
+                                    # vector_store工具接受字符串参数（JSON字符串或PMID）
+                                    # 如果解析失败，保持原字符串（可能是被截断的JSON，工具内部会尝试修复）
+                                    logger.debug(f"Keeping string args for vector_store (may be truncated JSON): {tool_args[:100]}...")
+                                    # tool_args保持为字符串，不需要修改
                                 else:
                                     # 其他工具，尝试转换为字符串
                                     tool_args = str(tool_args)
@@ -729,11 +1089,81 @@ def _create_fix_tool_calls_wrapper(agent_executor, tools):
                             try:
                                 # 执行工具
                                 if isinstance(tool_args, dict):
-                                    # 如果工具期望单个参数，提取第一个值
-                                    if len(tool_args) == 1:
-                                        tool_result = tool.run(list(tool_args.values())[0])
+                                    # 对于vector_store工具，它期望接收一个字符串参数（JSON字符串或PMID）
+                                    if tool_name == "vector_store":
+                                        # 如果字典有input_data键，使用该值
+                                        if "input_data" in tool_args:
+                                            input_data_value = tool_args["input_data"]
+                                            # 检查 input_data 值是否是不完整的 JSON 字符串
+                                            if isinstance(input_data_value, str):
+                                                # 如果字符串看起来像是不完整的 JSON（例如只有 '{' 或 '{\\\\'），尝试从消息历史中获取完整数据
+                                                stripped = input_data_value.strip()
+                                                if stripped.startswith('{') and (len(stripped) < 10 or not stripped.rstrip().endswith('}')):
+                                                    logger.warning(f"Detected potentially incomplete JSON in input_data: {stripped[:100]}...")
+                                                    # 尝试从消息历史中查找最近的 pubmed_fetch 工具结果
+                                                    # 查找最近的 ToolMessage，其内容可能是完整的 JSON
+                                                    if isinstance(input_dict, dict) and "messages" in input_dict:
+                                                        found_complete_data = False
+                                                        # 从后往前查找最近的 ToolMessage
+                                                        for msg in reversed(input_dict["messages"]):
+                                                            if hasattr(msg, 'content') and isinstance(msg.content, str):
+                                                                # 检查是否是 pubmed_fetch 的结果（通常包含 "pmid" 和 "title" 字段）
+                                                                if '"pmid"' in msg.content and '"title"' in msg.content:
+                                                                    # 尝试提取 JSON 数据
+                                                                    try:
+                                                                        import json
+                                                                        import re
+                                                                        # 尝试从内容中提取 JSON 对象
+                                                                        # 使用更可靠的方法：查找完整的 JSON 对象（处理嵌套）
+                                                                        # 首先尝试直接解析整个内容
+                                                                        try:
+                                                                            parsed = json.loads(msg.content)
+                                                                            if isinstance(parsed, dict) and "pmid" in parsed:
+                                                                                input_data_value = json.dumps(parsed, ensure_ascii=False)
+                                                                                logger.info(f"Found complete JSON data from previous message content, using it")
+                                                                                found_complete_data = True
+                                                                                break
+                                                                        except json.JSONDecodeError:
+                                                                            # 如果整个内容不是 JSON，尝试提取 JSON 对象
+                                                                            # 查找第一个 { 和匹配的 }
+                                                                            start_idx = msg.content.find('{')
+                                                                            if start_idx != -1:
+                                                                                brace_count = 0
+                                                                                end_idx = start_idx
+                                                                                for i in range(start_idx, len(msg.content)):
+                                                                                    if msg.content[i] == '{':
+                                                                                        brace_count += 1
+                                                                                    elif msg.content[i] == '}':
+                                                                                        brace_count -= 1
+                                                                                        if brace_count == 0:
+                                                                                            end_idx = i + 1
+                                                                                            break
+                                                                                if end_idx > start_idx:
+                                                                                    potential_json = msg.content[start_idx:end_idx]
+                                                                                    try:
+                                                                                        parsed = json.loads(potential_json)
+                                                                                        if isinstance(parsed, dict) and "pmid" in parsed:
+                                                                                            input_data_value = json.dumps(parsed, ensure_ascii=False)
+                                                                                            logger.info(f"Found complete JSON data from previous message, using it instead of incomplete input_data")
+                                                                                            found_complete_data = True
+                                                                                            break
+                                                                                    except json.JSONDecodeError:
+                                                                                        pass
+                                                                    except Exception as e:
+                                                                        logger.debug(f"Failed to extract JSON from previous message: {e}")
+                                                    if not found_complete_data:
+                                                        logger.debug(f"Could not find complete JSON data, passing incomplete input_data to tool for internal repair: {stripped[:200]}")
+                                            tool_result = tool.run(input_data_value)
+                                        else:
+                                            # 否则，将整个字典序列化为JSON字符串
+                                            import json
+                                            tool_result = tool.run(json.dumps(tool_args, ensure_ascii=False))
                                     else:
-                                        tool_result = tool.run(**tool_args)
+                                        # 其他工具：如果只有一个键值对，提取值；否则用**展开
+                                        if len(tool_args) == 1:
+                                            tool_result = tool.run(list(tool_args.values())[0])
+                                        else:
+                                            tool_result = tool.run(**tool_args)
                                 else:
                                     # 非字典参数，直接传递给工具（例如vector_store工具可能接受字符串PMID）
                                     tool_result = tool.run(tool_args)
@@ -758,15 +1188,93 @@ def _create_fix_tool_calls_wrapper(agent_executor, tools):
                     result["messages"].extend(tool_results)
                     logger.debug(f"Added {len(tool_results)} tool results, continuing agent execution...")
                     
+                    # 在调用前修复消息，确保tool_calls格式正确
+                    messages_to_send = _fix_messages_tool_calls(result["messages"])
+                    
                     # 继续执行agent，传入工具执行结果
-                    continue_result = agent_executor.invoke(
-                        {"messages": result["messages"]},
-                        config=config if config is not None else {}
-                    )
+                    try:
+                        continue_result = agent_executor.invoke(
+                            {"messages": messages_to_send},
+                            config=config if config is not None else {}
+                        )
+                    except Exception as e:
+                        # 如果遇到tool_calls验证错误，尝试从错误信息中修复
+                        error_str = str(e)
+                        if "tool_calls" in error_str and ("dict_type" in error_str or "Input should be a valid dictionary" in error_str):
+                            logger.warning(f"Caught tool_calls validation error in continue_result invoke: {e}")
+                            # 尝试从错误信息中提取并修复tool_calls
+                            fixed_messages = _extract_and_fix_tool_calls_from_error(error_str, messages_to_send)
+                            if fixed_messages:
+                                logger.info("Successfully extracted and fixed tool_calls from error, retrying...")
+                                messages_to_send = fixed_messages
+                                # 再次尝试调用
+                                try:
+                                    continue_result = agent_executor.invoke(
+                                        {"messages": messages_to_send},
+                                        config=config if config is not None else {}
+                                    )
+                                except Exception as e2:
+                                    # 如果重试仍然失败，尝试更激进的修复策略
+                                    logger.warning(f"Retry after fix still failed: {e2}")
+                                    # 尝试修复所有消息中的 tool_calls（包括字符串格式的）
+                                    messages_to_send = _fix_messages_tool_calls(messages_to_send)
+                                    # 再次尝试调用
+                                    continue_result = agent_executor.invoke(
+                                        {"messages": messages_to_send},
+                                        config=config if config is not None else {}
+                                    )
+                            else:
+                                # 如果无法从错误信息中修复，尝试更激进的修复策略
+                                logger.warning("Could not extract tool_calls from error, trying aggressive fix on all messages")
+                                # 尝试修复所有消息中的 tool_calls（包括字符串格式的）
+                                messages_to_send = _fix_messages_tool_calls(messages_to_send)
+                                # 再次尝试调用
+                                try:
+                                    continue_result = agent_executor.invoke(
+                                        {"messages": messages_to_send},
+                                        config=config if config is not None else {}
+                                    )
+                                except Exception as e2:
+                                    # 如果仍然失败，重新抛出原始错误
+                                    logger.error(f"All fix attempts failed, raising original error: {e}")
+                                    raise e
+                        else:
+                            # 其他类型的错误，直接抛出
+                            raise
+                    
                     # 更新结果并修复消息
                     if isinstance(continue_result, dict) and "messages" in continue_result:
                         # 修复返回的消息中的 tool_calls
                         result["messages"] = _fix_messages_tool_calls(continue_result["messages"])
+                        
+                        # 检查最后一条消息是否有新的tool_calls
+                        # 如果没有tool_calls，说明agent已经返回了最终答案，应该退出循环
+                        last_msg = None
+                        for msg in reversed(result["messages"]):
+                            if hasattr(msg, 'type') and msg.type == "ai":
+                                last_msg = msg
+                                break
+                        
+                        # 如果最后一条消息没有tool_calls或tool_calls已经全部执行完成，说明是最终答案
+                        if last_msg:
+                            has_new_tool_calls = False
+                            if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
+                                # 检查这些tool_calls是否已经执行
+                                tool_call_ids = [tc.get('id') if isinstance(tc, dict) else getattr(tc, 'id', '') 
+                                                for tc in last_msg.tool_calls]
+                                has_results = any(
+                                    hasattr(m, 'tool_call_id') and m.tool_call_id in tool_call_ids
+                                    for m in result["messages"]
+                                    if hasattr(m, 'tool_call_id')
+                                )
+                                # 如果有tool_calls但没有执行结果，说明需要继续执行
+                                if not has_results:
+                                    has_new_tool_calls = True
+                            
+                            # 如果没有新的tool_calls，说明agent已经返回了最终答案，退出循环
+                            if not has_new_tool_calls:
+                                logger.debug("Agent returned final answer (no more tool calls), exiting loop")
+                                break
                 else:
                     # 没有工具结果，退出循环
                     break
@@ -1098,20 +1606,22 @@ class PubMedAgent:
         
         Phase 1: Basic infrastructure - Agent creation
         Phase 2: Thought templates - Enhanced prompt integration
-        Enhanced with Chinese language support.
+        Enhanced with Chinese language support and structured workflow.
         Supports both LangChain 0.x and 1.0+ APIs.
         """
         if LANGCHAIN_VERSION == "1.0+":
             # LangChain 1.0+ API - use create_agent which returns a graph
             from .prompts import get_chinese_templates, get_english_templates
             
-            # Get appropriate system prompt based on language
+            # Get appropriate system prompt based on language - default to structured workflow
             if self.language == "zh":
                 templates = get_chinese_templates()
-                system_prompt = templates.get("chinese_scientific", templates["chinese"])
+                # Prefer structured template, fallback to scientific
+                system_prompt = templates.get("structured", templates.get("chinese_scientific", templates["chinese"]))
             else:
                 templates = get_english_templates()
-                system_prompt = templates.get("scientific", templates["basic"])
+                # Prefer structured template, fallback to scientific
+                system_prompt = templates.get("structured", templates.get("scientific", templates["basic"]))
             
             # Extract system prompt text from template
             if hasattr(system_prompt, 'template'):
@@ -1146,8 +1656,13 @@ class PubMedAgent:
             # Get tool names for the prompt
             tool_names = [tool.name for tool in self.tools]
             
-            # Create the base prompt template with language optimization
-            prompt = get_optimized_prompt("", language=self.language)
+            # Create the prompt template with structured workflow (default: structured=True)
+            from .prompts import get_react_prompt_template
+            prompt = get_react_prompt_template(
+                prompt_type="scientific",
+                language=self.language,
+                structured=True  # Default to structured workflow
+            )
             
             # Create ReAct agent
             agent = create_react_agent(
@@ -1368,7 +1883,7 @@ class PubMedAgent:
         Create agent executor with specific prompt type and language.
         
         Phase 4: Programmable thinking process - Dynamic prompt selection.
-        Enhanced with Chinese language support.
+        Enhanced with Chinese language support and structured workflow.
         Supports both LangChain 0.x and 1.0+ APIs.
         """
         if LANGCHAIN_VERSION == "1.0+":
@@ -1376,12 +1891,21 @@ class PubMedAgent:
             from .prompts import get_chinese_templates, get_english_templates
             
             # Get appropriate system prompt based on language
+            # For "scientific" type, prefer structured workflow
             if language == "zh":
                 templates = get_chinese_templates()
-                system_prompt = templates.get(f"chinese_{prompt_type}", templates.get("chinese_scientific", templates["chinese"]))
+                if prompt_type == "scientific":
+                    # Prefer structured template for scientific queries
+                    system_prompt = templates.get("structured", templates.get("chinese_scientific", templates["chinese"]))
+                else:
+                    system_prompt = templates.get(f"chinese_{prompt_type}", templates.get("chinese_scientific", templates["chinese"]))
             else:
                 templates = get_english_templates()
-                system_prompt = templates.get(prompt_type, templates.get("scientific", templates["basic"]))
+                if prompt_type == "scientific":
+                    # Prefer structured template for scientific queries
+                    system_prompt = templates.get("structured", templates.get("scientific", templates["basic"]))
+                else:
+                    system_prompt = templates.get(prompt_type, templates.get("scientific", templates["basic"]))
             
             # Extract system prompt text from template
             if hasattr(system_prompt, 'template'):
@@ -1416,22 +1940,21 @@ class PubMedAgent:
             tool_names = [tool.name for tool in self.tools]
             
             # Create the specific prompt template with language support
-            if language == "zh":
-                from .prompts import get_chinese_templates
-                templates = get_chinese_templates()
-                template_key = f"chinese_{prompt_type}"
-            else:
-                from .prompts import get_english_templates
-                templates = get_english_templates()
-                template_key = prompt_type
+            # Use structured workflow for scientific queries
+            from .prompts import get_react_prompt_template
+            use_structured = (prompt_type == "scientific")
             
-            template = templates.get(template_key, templates["scientific"])
+            prompt = get_react_prompt_template(
+                prompt_type=prompt_type,
+                language=language,
+                structured=use_structured
+            )
             
             # Create ReAct agent
             agent = create_react_agent(
                 llm=self.llm,
                 tools=self.tools,
-                prompt=template
+                prompt=prompt
             )
             
             # Create agent executor

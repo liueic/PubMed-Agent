@@ -4,6 +4,8 @@ Vector database system for PubMed Agent.
 """
 
 import logging
+import threading
+import time
 from typing import List, Dict, Any, Optional
 from abc import ABC, abstractmethod
 
@@ -15,6 +17,70 @@ from .embeddings import EmbeddingClient
 from .config import AgentConfig
 
 logger = logging.getLogger(__name__)
+
+# 模块级别的ChromaDB客户端缓存，按persist_directory路径缓存PersistentClient实例
+# 使用线程锁保证线程安全
+_chromadb_client_cache: Dict[str, chromadb.PersistentClient] = {}
+_chromadb_client_cache_lock = threading.Lock()
+# ChromaDB客户端缓存大小限制（通常只需要1个，但允许少量缓存以支持多路径）
+_chromadb_client_cache_max_size = 10
+
+
+def clear_chromadb_client_cache() -> int:
+    """
+    清空ChromaDB客户端缓存。
+    
+    Returns:
+        清空的缓存项数量
+    """
+    with _chromadb_client_cache_lock:
+        count = len(_chromadb_client_cache)
+        _chromadb_client_cache.clear()
+        logger.info(f"Cleared ChromaDB client cache: {count} entries removed")
+        return count
+
+
+def get_chromadb_client_cache_stats() -> Dict[str, int]:
+    """
+    获取ChromaDB客户端缓存的统计信息。
+    
+    Returns:
+        包含缓存大小等统计信息的字典
+    """
+    with _chromadb_client_cache_lock:
+        return {
+            "cache_size": len(_chromadb_client_cache),
+            "max_size": _chromadb_client_cache_max_size
+        }
+
+
+def _get_chromadb_client(persist_directory: str) -> chromadb.PersistentClient:
+    """
+    获取或创建ChromaDB PersistentClient实例，使用缓存避免重复创建。
+    
+    Args:
+        persist_directory: ChromaDB持久化目录路径
+        
+    Returns:
+        PersistentClient实例
+    """
+    with _chromadb_client_cache_lock:
+        if persist_directory not in _chromadb_client_cache:
+            # 如果缓存已满，删除最旧的项（简单策略：删除第一个）
+            if len(_chromadb_client_cache) >= _chromadb_client_cache_max_size:
+                oldest_key = next(iter(_chromadb_client_cache))
+                _chromadb_client_cache.pop(oldest_key)
+                logger.debug(f"ChromaDB client cache full, removed entry: {oldest_key}")
+            
+            logger.debug(f"Creating new ChromaDB PersistentClient for path: {persist_directory}")
+            _chromadb_client_cache[persist_directory] = chromadb.PersistentClient(
+                path=persist_directory,
+                settings=Settings(anonymized_telemetry=False)
+            )
+        else:
+            logger.debug(f"Reusing cached ChromaDB PersistentClient for path: {persist_directory}")
+        
+        return _chromadb_client_cache[persist_directory]
 
 
 def normalize_collection_name(thread_id: str) -> str:
@@ -120,11 +186,8 @@ class ChromaVectorDB(VectorDB):
             dimension=config.embedding_dimension
         )
         
-        # 初始化ChromaDB
-        self.client = chromadb.PersistentClient(
-            path=config.chroma_persist_directory,
-            settings=Settings(anonymized_telemetry=False)
-        )
+        # 使用缓存的ChromaDB客户端，避免重复创建
+        self.client = _get_chromadb_client(config.chroma_persist_directory)
         
         # 确定collection名称，默认使用"pubmed_articles"（向后兼容）
         if collection_name is None:
@@ -151,18 +214,26 @@ class ChromaVectorDB(VectorDB):
             是否成功
         """
         try:
-            # 生成嵌入向量
+            start_time = time.time()
+            
+            # 生成嵌入向量（批量处理，已优化）
+            embedding_start = time.time()
             embeddings = self.embedding_client.embed_texts(texts)
+            embedding_time = time.time() - embedding_start
             
             # 存储到ChromaDB
+            storage_start = time.time()
             self.collection.add(
                 embeddings=embeddings,
                 documents=texts,
                 metadatas=metadatas,
                 ids=ids
             )
+            storage_time = time.time() - storage_start
+            total_time = time.time() - start_time
             
-            logger.info(f"Stored {len(texts)} documents to vector database")
+            logger.info(f"Stored {len(texts)} documents to vector database "
+                      f"(embedding: {embedding_time:.2f}s, storage: {storage_time:.2f}s, total: {total_time:.2f}s)")
             return True
             
         except Exception as e:
@@ -182,15 +253,21 @@ class ChromaVectorDB(VectorDB):
             搜索结果列表，每个结果包含文档、元数据和相似度分数
         """
         try:
+            start_time = time.time()
+            
             # 生成查询向量
+            embedding_start = time.time()
             query_embedding = self.embedding_client.embed_text(query)
+            embedding_time = time.time() - embedding_start
             
             # 执行搜索
+            search_start = time.time()
             results = self.collection.query(
                 query_embeddings=[query_embedding],
                 n_results=n_results,
                 where=filter_dict if filter_dict else None
             )
+            search_time = time.time() - search_start
             
             # 格式化结果
             formatted_results = []
@@ -209,7 +286,9 @@ class ChromaVectorDB(VectorDB):
                         'score': 1 - distance  # 将距离转换为相似度分数（余弦距离）
                     })
             
-            logger.info(f"Found {len(formatted_results)} results for query: {query[:50]}...")
+            total_time = time.time() - start_time
+            logger.info(f"Found {len(formatted_results)} results for query: {query[:50]}... "
+                      f"(embedding: {embedding_time:.2f}s, search: {search_time:.2f}s, total: {total_time:.2f}s)")
             return formatted_results
             
         except Exception as e:

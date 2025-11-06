@@ -5,6 +5,8 @@ Phase 1: Basic infrastructure - Tool system.
 
 import logging
 import json
+import threading
+import time
 from typing import List, Optional, Dict, Any
 from langchain.tools import BaseTool
 from langchain_core.tools import tool
@@ -13,6 +15,41 @@ from .vector_db import create_vector_db, get_collection_name
 from .utils import chunk_text, PubMedRateLimiter, parse_pubmed_date
 
 logger = logging.getLogger(__name__)
+
+# 模块级别的向量数据库缓存，按collection_name缓存实例
+# 使用线程锁保证线程安全
+_vector_db_cache: Dict[str, Any] = {}
+_vector_db_cache_lock = threading.Lock()
+# 向量数据库缓存大小限制（最多缓存50个实例）
+_vector_db_cache_max_size = 50
+
+
+def clear_vector_db_cache() -> int:
+    """
+    清空向量数据库缓存。
+    
+    Returns:
+        清空的缓存项数量
+    """
+    with _vector_db_cache_lock:
+        count = len(_vector_db_cache)
+        _vector_db_cache.clear()
+        logger.info(f"Cleared vector database cache: {count} entries removed")
+        return count
+
+
+def get_vector_db_cache_stats() -> Dict[str, int]:
+    """
+    获取向量数据库缓存的统计信息。
+    
+    Returns:
+        包含缓存大小等统计信息的字典
+    """
+    with _vector_db_cache_lock:
+        return {
+            "cache_size": len(_vector_db_cache),
+            "max_size": _vector_db_cache_max_size
+        }
 
 
 def _parse_pubmed_article_xml(article_elem) -> Optional[Dict[str, Any]]:
@@ -187,9 +224,12 @@ class PubMedSearchTool(BaseTool):
     
     name: str = "pubmed_search"
     description: str = (
-        "Search PubMed for scientific articles. "
-        "Input should be a search query string. "
-        "Returns a list of articles with PMIDs."
+        "Search PubMed for scientific articles using keywords extracted from user intent. "
+        "This is STEP 2 in the structured workflow: query PubMed with relevant keywords. "
+        "Input should be a search query string with key terms. "
+        "Returns a formatted list of articles with PMIDs, titles, authors, journals, abstracts, and MeSH terms. "
+        "The output format is designed to facilitate article selection in the next step. "
+        "Use this tool after parsing user intent to search for relevant literature."
     )
     
     # 使用类级别的变量存储配置和速率限制器
@@ -416,10 +456,12 @@ class PubMedFetchTool(BaseTool):
     
     name: str = "pubmed_fetch"
     description: str = (
-        "Fetch a single article from PubMed by its PMID (PubMed ID). "
-        "Input should be a PMID string (e.g., '12345678'). "
-        "Returns JSON-formatted article data that can be directly stored using vector_store tool. "
-        "Use this tool when you have a specific PMID and need to retrieve the full article details."
+        "Fetch detailed information for a single article from PubMed by its PMID (PubMed ID). "
+        "This is STEP 4 in the structured workflow: get complete article details for selected articles. "
+        "Input should be a PMID string (e.g., '12345678') from articles selected in STEP 3. "
+        "Returns JSON-formatted article data including title, abstract, authors, journal, MeSH terms, keywords, and metadata. "
+        "The output is in the correct format to be directly stored using vector_store tool. "
+        "Use this tool after selecting interesting articles from search results to get their complete information."
     )
     
     # 使用类级别的变量存储配置和速率限制器
@@ -569,8 +611,12 @@ class VectorDBStoreTool(BaseTool):
     name: str = "vector_store"
     description: str = (
         "Store an article in the vector database for semantic search. "
-        "Input should be a PMID (PubMed ID) or a JSON string with PMID and article content. "
-        "Returns confirmation message."
+        "This is STEP 6 in the structured workflow: store high-quality, relevant articles that passed evaluation in STEP 5. "
+        "Input should be JSON-formatted article data from pubmed_fetch tool (already in correct format). "
+        "Only store articles that are highly relevant, have complete information, and provide unique contributions. "
+        "The tool will chunk the article text and create embeddings for semantic retrieval. "
+        "Returns confirmation message with number of chunks stored. "
+        "Use this tool after evaluating fetched articles to store only the most valuable ones."
     )
     
     # 使用类级别的变量存储配置和向量数据库
@@ -598,7 +644,7 @@ class VectorDBStoreTool(BaseTool):
         return self._config
     
     def _get_vector_db(self):
-        """动态获取向量数据库实例，根据当前thread_id创建对应的collection"""
+        """动态获取向量数据库实例，根据当前thread_id创建对应的collection，使用缓存避免重复创建"""
         thread_id = None
         if self._thread_id_getter:
             try:
@@ -607,7 +653,22 @@ class VectorDBStoreTool(BaseTool):
                 logger.warning(f"Failed to get thread_id: {e}, using default collection")
         
         collection_name = get_collection_name(thread_id)
-        return create_vector_db(self._config, collection_name=collection_name)
+        
+        # 使用缓存机制，避免重复创建向量数据库实例
+        with _vector_db_cache_lock:
+            if collection_name not in _vector_db_cache:
+                # 如果缓存已满，删除最旧的项（简单策略：删除第一个）
+                if len(_vector_db_cache) >= _vector_db_cache_max_size:
+                    oldest_key = next(iter(_vector_db_cache))
+                    _vector_db_cache.pop(oldest_key)
+                    logger.debug(f"Vector DB cache full, removed entry: {oldest_key}")
+                
+                logger.debug(f"Creating new vector database instance for collection: {collection_name}")
+                _vector_db_cache[collection_name] = create_vector_db(self._config, collection_name=collection_name)
+            else:
+                logger.debug(f"Reusing cached vector database instance for collection: {collection_name}")
+            
+            return _vector_db_cache[collection_name]
     
     def _run(self, input_data: str) -> str:
         """
@@ -627,7 +688,40 @@ class VectorDBStoreTool(BaseTool):
                     # 如果不是字符串，尝试转换为字符串
                     input_data = str(input_data)
                 
-                data = json.loads(input_data)
+                # 尝试修复可能被截断的JSON字符串
+                fixed_input = input_data.strip()
+                
+                # 处理可能的双重编码（外层有引号）
+                if fixed_input.startswith('"') and fixed_input.endswith('"'):
+                    # 去除外层引号
+                    fixed_input = fixed_input[1:-1]
+                    # 处理转义的引号
+                    fixed_input = fixed_input.replace('\\"', '"')
+                
+                # 如果字符串看起来像JSON但可能被截断（以不完整的引号或括号结尾）
+                if fixed_input.startswith('{') and not fixed_input.rstrip().endswith('}'):
+                    # 尝试补全JSON结构
+                    # 检查是否有未闭合的字符串值（考虑转义引号）
+                    # 简单方法：统计未转义的引号
+                    unescaped_quotes = 0
+                    i = 0
+                    while i < len(fixed_input):
+                        if fixed_input[i] == '"' and (i == 0 or fixed_input[i-1] != '\\'):
+                            unescaped_quotes += 1
+                        i += 1
+                    
+                    # 如果有奇数个未转义的引号，说明有未闭合的字符串
+                    if unescaped_quotes % 2 != 0:
+                        # 有未闭合的引号，尝试补全
+                        if not fixed_input.rstrip().endswith('"'):
+                            fixed_input = fixed_input.rstrip() + '"'
+                    
+                    # 补全闭合括号
+                    if not fixed_input.rstrip().endswith('}'):
+                        fixed_input = fixed_input.rstrip() + '}'
+                    logger.debug(f"Attempting to fix truncated JSON: {fixed_input[:100]}...")
+                
+                data = json.loads(fixed_input)
                 
                 # 检查解析结果是否为字典类型
                 if not isinstance(data, dict):
@@ -654,9 +748,14 @@ class VectorDBStoreTool(BaseTool):
                 issue = data.get("issue", "")
                 pages = data.get("pages", "")
                 journal_iso = data.get("journal_iso", "")
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                # JSON解析失败，尝试使用原始输入
+                logger.warning(f"JSON解析失败，尝试使用原始输入: {e}")
+                # 如果原始输入看起来像JSON（以{开头），记录详细信息
+                if isinstance(input_data, str) and input_data.strip().startswith('{'):
+                    logger.warning(f"输入看起来像JSON但解析失败，可能是格式错误或被截断: {input_data[:200]}...")
+                    return f"Error: Invalid JSON format for article data. Please provide valid JSON-formatted article data from pubmed_fetch tool."
                 # 如果不是JSON，假设是PMID字符串，需要从其他地方获取文章内容
-                # 这里暂时返回占位符，实际实现需要调用PubMed API
                 pmid = input_data.strip() if isinstance(input_data, str) else str(input_data).strip()
                 logger.warning(f"PMID only provided, but article content fetching not implemented yet: {pmid}")
                 return f"Note: Storage for PMID {pmid} requires article content. Please provide article data in JSON format."
@@ -728,12 +827,17 @@ class VectorDBStoreTool(BaseTool):
                 ids.append(f"{pmid}_chunk_{i}")
             
             # 存储到向量数据库（动态获取对应的collection）
+            start_time = time.time()
             vector_db = self._get_vector_db()
             success = vector_db.store(texts=texts, metadatas=metadatas, ids=ids)
+            elapsed_time = time.time() - start_time
             
             if success:
+                logger.info(f"Performance: Stored {len(chunks)} chunks for PMID {pmid} in {elapsed_time:.2f}s "
+                          f"({len(chunks)/elapsed_time:.1f} chunks/s)")
                 return f"Successfully stored article with PMID {pmid} ({len(chunks)} chunks)"
             else:
+                logger.warning(f"Performance: Failed to store {len(chunks)} chunks for PMID {pmid} after {elapsed_time:.2f}s")
                 return f"Error storing article with PMID {pmid}"
                 
         except Exception as e:
@@ -750,9 +854,13 @@ class VectorSearchTool(BaseTool):
     
     name: str = "vector_search"
     description: str = (
-        "Search the vector database for semantically similar articles. "
-        "Input should be a search query string. "
-        "Returns relevant articles from stored database with PMIDs and similarity scores."
+        "Search the vector database for semantically similar article chunks. "
+        "This is STEP 7 in the structured workflow: retrieve the best matching papers from stored articles. "
+        "Input should be the original user question or refined query based on user intent. "
+        "Uses semantic similarity to find the most relevant content from articles stored in STEP 6. "
+        "Returns relevant article chunks with PMIDs, titles, similarity scores, and content previews. "
+        "The results are ranked by relevance and can be used to synthesize the final answer. "
+        "Use this tool after storing articles to find the best information for answering the user's question."
     )
     
     # 使用类级别的变量存储配置和向量数据库
@@ -780,7 +888,7 @@ class VectorSearchTool(BaseTool):
         return self._config
     
     def _get_vector_db(self):
-        """动态获取向量数据库实例，根据当前thread_id创建对应的collection"""
+        """动态获取向量数据库实例，根据当前thread_id创建对应的collection，使用缓存避免重复创建"""
         thread_id = None
         if self._thread_id_getter:
             try:
@@ -789,7 +897,22 @@ class VectorSearchTool(BaseTool):
                 logger.warning(f"Failed to get thread_id: {e}, using default collection")
         
         collection_name = get_collection_name(thread_id)
-        return create_vector_db(self._config, collection_name=collection_name)
+        
+        # 使用缓存机制，避免重复创建向量数据库实例
+        with _vector_db_cache_lock:
+            if collection_name not in _vector_db_cache:
+                # 如果缓存已满，删除最旧的项（简单策略：删除第一个）
+                if len(_vector_db_cache) >= _vector_db_cache_max_size:
+                    oldest_key = next(iter(_vector_db_cache))
+                    _vector_db_cache.pop(oldest_key)
+                    logger.debug(f"Vector DB cache full, removed entry: {oldest_key}")
+                
+                logger.debug(f"Creating new vector database instance for collection: {collection_name}")
+                _vector_db_cache[collection_name] = create_vector_db(self._config, collection_name=collection_name)
+            else:
+                logger.debug(f"Reusing cached vector database instance for collection: {collection_name}")
+            
+            return _vector_db_cache[collection_name]
     
     def _run(self, query: str) -> str:
         """Execute vector search."""
@@ -798,14 +921,19 @@ class VectorSearchTool(BaseTool):
                 return "Error: Search query is required"
             
             # 执行搜索（动态获取对应的collection）
+            start_time = time.time()
             vector_db = self._get_vector_db()
             results = vector_db.search(
                 query=query,
                 n_results=self.config.max_retrieve_results
             )
+            elapsed_time = time.time() - start_time
             
             if not results:
+                logger.info(f"Performance: Vector search for '{query[:50]}...' completed in {elapsed_time:.2f}s, no results")
                 return f"No relevant articles found for query: {query}"
+            
+            logger.info(f"Performance: Vector search for '{query[:50]}...' found {len(results)} results in {elapsed_time:.2f}s")
             
             # 格式化结果
             formatted_results = []
