@@ -130,6 +130,49 @@ cp .env.example .env
 # - OPENAI_API_KEY: Your API key (OpenAI or other compatible service)
 ```
 
+#### PubMed API 配置 (PubMed API Configuration)
+
+**重要提示**: NCBI要求提供真实的email地址以符合使用政策。强烈建议配置 `PUBMED_EMAIL` 和 `PUBMED_API_KEY`。
+
+**Important**: NCBI requires a real email address to comply with usage policies. It is strongly recommended to configure `PUBMED_EMAIL` and `PUBMED_API_KEY`.
+
+**配置步骤 (Configuration Steps)**:
+
+1. **注册NCBI账户 (Register NCBI Account)**:
+   - 访问 https://www.ncbi.nlm.nih.gov/
+   - 点击右上角"登录" → "创建新账户"
+   - 填写必要信息完成注册
+
+2. **获取API密钥 (Get API Key)** (可选但推荐):
+   - 登录NCBI账户
+   - 进入"我的NCBI" → 找到"API密钥"选项
+   - 生成并复制您的API密钥
+
+3. **配置环境变量 (Configure Environment Variables)**:
+```bash
+# 必需配置（强烈推荐）
+# Required configuration (strongly recommended)
+PUBMED_EMAIL=your_email@example.com
+
+# 可选配置（推荐以提升速率限制：从3次/秒提升至10次/秒）
+# Optional configuration (recommended to increase rate limit: from 3 to 10 requests/sec)
+PUBMED_API_KEY=your_ncbi_api_key
+
+# 可选：自定义工具名称
+# Optional: Custom tool name
+PUBMED_TOOL_NAME=pubmed_agent
+```
+
+**速率限制说明 (Rate Limit Information)**:
+- **未配置API Key**: 3次/秒
+- **配置API Key**: 10次/秒
+- **未配置Email**: 使用临时邮箱，可能导致API访问受限
+
+**Rate Limit Information**:
+- **Without API Key**: 3 requests/second
+- **With API Key**: 10 requests/second
+- **Without Email**: Using temporary email may result in API access restrictions
+
 #### 自定义API Endpoint (Custom API Endpoint)
 
 项目支持使用自定义API endpoint，允许您使用：

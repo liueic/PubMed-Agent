@@ -9,7 +9,8 @@ Enhanced with comprehensive Chinese language support.
 
 import logging
 import json
-from typing import List, Dict, Any, Optional
+import uuid
+from typing import List, Dict, Any, Optional, Callable
 
 # LangChain imports with version compatibility
 # LangChain 1.0+ uses a different API, so we need to handle both old and new versions
@@ -324,6 +325,7 @@ def _fix_tool_calls_args(message):
             tool_call_dict = tool_call.copy()
             if 'args' in tool_call_dict:
                 args = tool_call_dict['args']
+                # 检查args是否为字符串类型
                 if isinstance(args, str):
                     # 使用递归解析处理双重编码
                     parsed_args = _recursive_parse_json(args)
@@ -332,7 +334,25 @@ def _fix_tool_calls_args(message):
                         fixed = True
                         logger.debug(f"Fixed tool_call args from string to dict: {args[:50]}...")
                     else:
-                        logger.warning(f"Failed to parse tool_call args as dict: {args[:50]}...")
+                        # 如果解析后仍不是字典，记录警告但继续处理
+                        logger.warning(f"Failed to parse tool_call args as dict, got {type(parsed_args).__name__}: {args[:100]}...")
+                        # 尝试将解析结果包装为字典（如果解析失败，使用空字典）
+                        tool_call_dict['args'] = parsed_args if isinstance(parsed_args, dict) else {}
+                elif not isinstance(args, dict):
+                    # 如果args既不是字符串也不是字典，记录警告并尝试转换
+                    logger.warning(f"Tool call args is neither string nor dict (type: {type(args).__name__}), attempting conversion")
+                    try:
+                        # 尝试转换为字符串再解析
+                        args_str = str(args)
+                        parsed_args = _recursive_parse_json(args_str)
+                        if isinstance(parsed_args, dict):
+                            tool_call_dict['args'] = parsed_args
+                            fixed = True
+                        else:
+                            tool_call_dict['args'] = {}
+                    except Exception as e:
+                        logger.error(f"Failed to convert args to dict: {e}")
+                        tool_call_dict['args'] = {}
             fixed_tool_calls.append(tool_call_dict)
         elif hasattr(tool_call, 'args'):
             # 处理对象格式的 tool_call
@@ -344,7 +364,29 @@ def _fix_tool_calls_args(message):
                     fixed = True
                     logger.debug(f"Fixed tool_call args from string to dict")
                 else:
-                    logger.warning(f"Failed to parse tool_call args as dict")
+                    logger.warning(f"Failed to parse tool_call args as dict, got {type(parsed_args).__name__}")
+                    # 尝试将解析结果赋值为空字典
+                    try:
+                        tool_call.args = parsed_args if isinstance(parsed_args, dict) else {}
+                    except:
+                        logger.warning("Failed to update tool_call.args")
+            elif not isinstance(tool_call.args, dict):
+                # 如果args既不是字符串也不是字典，尝试转换
+                logger.warning(f"Tool call args is neither string nor dict (type: {type(tool_call.args).__name__}), attempting conversion")
+                try:
+                    args_str = str(tool_call.args)
+                    parsed_args = _recursive_parse_json(args_str)
+                    if isinstance(parsed_args, dict):
+                        tool_call.args = parsed_args
+                        fixed = True
+                    else:
+                        tool_call.args = {}
+                except Exception as e:
+                    logger.error(f"Failed to convert args to dict: {e}")
+                    try:
+                        tool_call.args = {}
+                    except:
+                        pass
             fixed_tool_calls.append(tool_call)
         else:
             fixed_tool_calls.append(tool_call)
@@ -540,8 +582,30 @@ def _create_fix_tool_calls_wrapper(agent_executor, tools):
             # 修复输入消息
             input_dict["messages"] = _fix_messages_tool_calls(input_dict["messages"])
         
-        # 调用原始的 agent_executor
-        result = agent_executor.invoke(input_dict, config=config if config is not None else {})
+        # 调用原始的 agent_executor，捕获验证错误
+        try:
+            result = agent_executor.invoke(input_dict, config=config if config is not None else {})
+        except Exception as e:
+            # 如果遇到tool_calls验证错误，尝试从错误信息中修复
+            error_str = str(e)
+            if "tool_calls" in error_str and ("dict_type" in error_str or "Input should be a valid dictionary" in error_str):
+                logger.warning(f"Caught tool_calls validation error in agent_executor: {e}")
+                # 尝试从错误信息中提取tool_calls数据并修复
+                import re
+                # 查找所有tool_calls的args字符串
+                matches = re.findall(r"input_value='([^']+)'", error_str)
+                if matches:
+                    logger.info(f"Found {len(matches)} tool_call args in error message, attempting to fix...")
+                    # 尝试重新调用，但这次在LLM层面修复
+                    # 由于我们无法直接修改已经验证失败的消息，我们需要在下一轮修复
+                    # 但首先，让我们尝试修复输入，然后重试
+                    result = agent_executor.invoke(input_dict, config=config if config is not None else {})
+                else:
+                    # 如果无法提取，重新抛出错误
+                    raise
+            else:
+                # 其他类型的错误，直接抛出
+                raise
         
         # 修复返回消息并处理invalid_tool_calls
         if isinstance(result, dict) and "messages" in result:
@@ -631,6 +695,26 @@ def _create_fix_tool_calls_wrapper(agent_executor, tools):
                     tool_args = cleaned_tool_call.get('args') if isinstance(cleaned_tool_call, dict) else getattr(cleaned_tool_call, 'args', {})
                     tool_id = cleaned_tool_call.get('id') if isinstance(cleaned_tool_call, dict) else getattr(cleaned_tool_call, 'id', '')
                     
+                    # 确保tool_args是字典类型（如果不是，尝试修复）
+                    if not isinstance(tool_args, dict):
+                        logger.warning(f"Tool args for {tool_name} is not a dict (type: {type(tool_args).__name__}), attempting to fix")
+                        if isinstance(tool_args, str):
+                            # 尝试解析JSON字符串
+                            parsed_args = _recursive_parse_json(tool_args)
+                            if isinstance(parsed_args, dict):
+                                tool_args = parsed_args
+                            else:
+                                # 如果解析失败，根据工具名称决定如何处理
+                                if tool_name == "vector_store":
+                                    # vector_store工具接受字符串参数（PMID），保持原样
+                                    pass
+                                else:
+                                    # 其他工具，尝试转换为字符串
+                                    tool_args = str(tool_args)
+                        else:
+                            # 非字符串非字典类型，尝试转换为字符串
+                            tool_args = str(tool_args)
+                    
                     # 最终清理工具参数
                     if isinstance(tool_args, dict):
                         tool_args = _clean_temp_markers(tool_args)
@@ -650,6 +734,7 @@ def _create_fix_tool_calls_wrapper(agent_executor, tools):
                                     else:
                                         tool_result = tool.run(**tool_args)
                                 else:
+                                    # 非字典参数，直接传递给工具（例如vector_store工具可能接受字符串PMID）
                                     tool_result = tool.run(tool_args)
                                 
                                 # 创建ToolMessage
@@ -785,6 +870,10 @@ class PubMedAgent:
         self.config = config or AgentConfig()
         self.language = language
         
+        # Thread ID management for vector database isolation
+        self._current_thread_id: Optional[str] = None
+        self._thread_id_getter: Optional[Callable[[], Optional[str]]] = None
+        
         # Initialize LLM with controlled temperature for factual responses
         # Support custom API endpoint for compatibility with OpenAI-compatible APIs
         llm_kwargs = {
@@ -813,20 +902,131 @@ class PubMedAgent:
             def __init__(self, base_llm_instance):
                 self._base_llm = base_llm_instance
             
+            def _fix_response_before_validation(self, response_data):
+                """
+                在Pydantic验证之前修复响应数据。
+                尝试从原始响应数据中修复tool_calls的args字段。
+                """
+                try:
+                    # 如果response_data是字典（可能是原始API响应），尝试修复
+                    if isinstance(response_data, dict):
+                        # 检查是否有tool_calls字段
+                        if 'tool_calls' in response_data:
+                            tool_calls = response_data['tool_calls']
+                            if isinstance(tool_calls, list):
+                                fixed_tool_calls = []
+                                for tc in tool_calls:
+                                    if isinstance(tc, dict) and 'args' in tc:
+                                        if isinstance(tc['args'], str):
+                                            parsed = _recursive_parse_json(tc['args'])
+                                            if isinstance(parsed, dict):
+                                                tc['args'] = parsed
+                                                fixed_tool_calls.append(tc)
+                                            else:
+                                                fixed_tool_calls.append(tc)
+                                        else:
+                                            fixed_tool_calls.append(tc)
+                                    else:
+                                        fixed_tool_calls.append(tc)
+                                response_data['tool_calls'] = fixed_tool_calls
+                        # 检查choices字段（OpenAI格式）
+                        if 'choices' in response_data:
+                            for choice in response_data.get('choices', []):
+                                if 'message' in choice:
+                                    message = choice['message']
+                                    if 'tool_calls' in message:
+                                        tool_calls = message['tool_calls']
+                                        if isinstance(tool_calls, list):
+                                            fixed_tool_calls = []
+                                            for tc in tool_calls:
+                                                if isinstance(tc, dict) and 'function' in tc:
+                                                    func = tc['function']
+                                                    if isinstance(func, dict) and 'arguments' in func:
+                                                        if isinstance(func['arguments'], str):
+                                                            parsed = _recursive_parse_json(func['arguments'])
+                                                            if isinstance(parsed, dict):
+                                                                func['arguments'] = parsed
+                                                            fixed_tool_calls.append(tc)
+                                                        else:
+                                                            fixed_tool_calls.append(tc)
+                                                    else:
+                                                        fixed_tool_calls.append(tc)
+                                                else:
+                                                    fixed_tool_calls.append(tc)
+                                            message['tool_calls'] = fixed_tool_calls
+                except Exception as e:
+                    logger.warning(f"Error fixing response before validation: {e}")
+                return response_data
+            
             def invoke(self, input, config=None, **kwargs):
                 """调用LLM并修复返回的消息"""
-                result = self._base_llm.invoke(input, config=config, **kwargs)
-                return _fix_tool_calls_args(result)
+                try:
+                    result = self._base_llm.invoke(input, config=config, **kwargs)
+                    return _fix_tool_calls_args(result)
+                except Exception as e:
+                    # 如果验证失败，尝试从错误中提取信息并修复
+                    error_str = str(e)
+                    if "tool_calls" in error_str and ("dict_type" in error_str or "Input should be a valid dictionary" in error_str):
+                        logger.warning(f"Caught validation error for tool_calls, attempting to fix: {e}")
+                        # 尝试从原始响应中修复
+                        try:
+                            # 检查base_llm是否有_client属性，如果有，我们可以尝试直接调用API
+                            if hasattr(self._base_llm, '_client'):
+                                # 尝试使用原始客户端调用，然后在响应中修复
+                                import inspect
+                                # 获取调用的原始参数
+                                # 这里我们需要手动构造消息并调用API
+                                pass
+                            
+                            # 如果无法从底层修复，尝试使用LangChain的fallback机制
+                            # 创建一个修复后的消息对象
+                            from langchain_core.messages import AIMessage
+                            from langchain_core.exceptions import OutputParserException
+                            
+                            # 尝试从错误信息中提取tool_calls数据
+                            # 错误信息格式: Input should be a valid dictionary [type=dict_type, input_value='{"query": "..."}', input_type=str]
+                            import re
+                            match = re.search(r"input_value='([^']+)'", error_str)
+                            if match:
+                                args_str = match.group(1)
+                                # 尝试解析args字符串
+                                parsed_args = _recursive_parse_json(args_str)
+                                if isinstance(parsed_args, dict):
+                                    logger.info(f"Successfully parsed args from error message: {list(parsed_args.keys())}")
+                                    # 这里我们需要重新构造消息，但我们需要完整的tool_call信息
+                                    # 由于信息不完整，我们只能记录并重试
+                                    pass
+                            
+                            # 如果所有修复尝试都失败，重新调用（可能会再次失败，但至少尝试了）
+                            logger.warning("Retrying LLM call after validation error...")
+                            result = self._base_llm.invoke(input, config=config, **kwargs)
+                            return _fix_tool_calls_args(result)
+                        except Exception as inner_e:
+                            logger.error(f"Failed to fix validation error: {inner_e}")
+                            # 如果修复失败，抛出原始错误
+                            raise e
+                    raise
             
             def batch(self, inputs, config=None, **kwargs):
                 """批量调用LLM并修复返回的消息"""
-                results = self._base_llm.batch(inputs, config=config, **kwargs)
-                return [_fix_tool_calls_args(msg) for msg in results]
+                try:
+                    results = self._base_llm.batch(inputs, config=config, **kwargs)
+                    return [_fix_tool_calls_args(msg) for msg in results]
+                except Exception as e:
+                    logger.warning(f"Error in batch call: {e}")
+                    # 尝试修复后重新调用
+                    results = self._base_llm.batch(inputs, config=config, **kwargs)
+                    return [_fix_tool_calls_args(msg) for msg in results]
             
             def stream(self, input, config=None, **kwargs):
                 """流式调用LLM并修复返回的消息"""
-                for chunk in self._base_llm.stream(input, config=config, **kwargs):
-                    yield _fix_tool_calls_args(chunk)
+                try:
+                    for chunk in self._base_llm.stream(input, config=config, **kwargs):
+                        yield _fix_tool_calls_args(chunk)
+                except Exception as e:
+                    logger.warning(f"Error in stream call: {e}")
+                    for chunk in self._base_llm.stream(input, config=config, **kwargs):
+                        yield _fix_tool_calls_args(chunk)
             
             # 代理所有其他方法和属性到base_llm
             def __getattr__(self, name):
@@ -835,19 +1035,35 @@ class PubMedAgent:
                 if callable(attr):
                     # 如果是方法，包装它以确保返回的消息也被修复
                     def wrapper(*args, **kwargs):
-                        result = attr(*args, **kwargs)
-                        # 如果结果是消息对象，修复它
-                        if hasattr(result, 'tool_calls'):
-                            return _fix_tool_calls_args(result)
-                        return result
+                        try:
+                            result = attr(*args, **kwargs)
+                            # 如果结果是消息对象，修复它
+                            if hasattr(result, 'tool_calls'):
+                                return _fix_tool_calls_args(result)
+                            return result
+                        except Exception as e:
+                            # 如果调用失败且是验证错误，尝试修复
+                            error_str = str(e)
+                            if "tool_calls" in error_str:
+                                logger.warning(f"Error in {name}, attempting fix: {e}")
+                                raise
+                            raise
                     return wrapper
                 return attr
         
         # 使用包装的LLM
         self.llm = FixedChatOpenAI(base_llm)
         
+        # Initialize tools with thread_id_getter (will be set up in _create_agent)
+        # 先创建thread_id_getter函数
+        def get_thread_id():
+            """获取当前thread_id"""
+            return self._current_thread_id
+        
+        self._thread_id_getter = get_thread_id
+        
         # Initialize tools
-        self.tools = create_tools(self.config)
+        self.tools = create_tools(self.config, thread_id_getter=self._thread_id_getter)
         
         # Initialize memory for conversation context
         if HAS_OLD_MEMORY:
@@ -960,6 +1176,20 @@ class PubMedAgent:
         try:
             logger.info(f"Processing query: {question}")
             
+            # Generate or get thread_id for vector database isolation
+            # 对于LangChain 1.0+，可以从config中获取thread_id；否则生成新的UUID
+            if LANGCHAIN_VERSION == "1.0+":
+                # 在LangChain 1.0+中，每个query都会生成新的thread_id
+                # 使用UUID生成唯一的thread_id
+                thread_id = str(uuid.uuid4())
+            else:
+                # LangChain 0.x中，如果没有指定thread_id，生成新的UUID
+                thread_id = str(uuid.uuid4())
+            
+            # 设置当前thread_id，工具会通过thread_id_getter获取
+            self._current_thread_id = thread_id
+            logger.info(f"Using thread_id for vector database isolation: {thread_id}")
+            
             # Determine language for this query
             query_language = language or self.language
             if query_language == "auto":
@@ -981,7 +1211,8 @@ class PubMedAgent:
                 from langchain_core.messages import HumanMessage
                 config = {}
                 if self.memory:
-                    config = {"configurable": {"thread_id": "default"}}
+                    # 使用生成的thread_id，而不是"default"
+                    config = {"configurable": {"thread_id": thread_id}}
                 
                 # Invoke with messages format
                 result = self.agent_executor.invoke(
@@ -1051,6 +1282,7 @@ class PubMedAgent:
                 "intermediate_steps": result.get("intermediate_steps", []) if isinstance(result, dict) else [],
                 "prompt_type": prompt_type,
                 "language": query_language,
+                "thread_id": thread_id,  # 添加thread_id信息
                 "success": True
             }
             
@@ -1076,6 +1308,7 @@ class PubMedAgent:
                 "intermediate_steps": [],
                 "prompt_type": prompt_type or "scientific",
                 "language": language or self.language,
+                "thread_id": self._current_thread_id,  # 即使出错也记录thread_id
                 "success": False,
                 "error": error_msg,
                 "error_details": error_details
@@ -1183,6 +1416,11 @@ class PubMedAgent:
         try:
             logger.info(f"Searching and storing articles for: {query}")
             
+            # Generate thread_id for vector database isolation
+            thread_id = str(uuid.uuid4())
+            self._current_thread_id = thread_id
+            logger.info(f"Using thread_id for vector database isolation: {thread_id}")
+            
             # Use the PubMed search tool
             pubmed_tool = next(tool for tool in self.tools if tool.name == "pubmed_search")
             search_result = pubmed_tool.run(query)
@@ -1210,6 +1448,7 @@ class PubMedAgent:
                 "search_result": search_result,
                 "pmids_found": len(pmids),
                 "articles_stored": stored_count,
+                "thread_id": thread_id,  # 添加thread_id信息
                 "success": True
             }
             
@@ -1222,6 +1461,7 @@ class PubMedAgent:
                 "search_result": "",
                 "pmids_found": 0,
                 "articles_stored": 0,
+                "thread_id": self._current_thread_id,  # 即使出错也记录thread_id
                 "success": False,
                 "error": error_msg
             }

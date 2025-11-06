@@ -17,6 +17,45 @@ from .config import AgentConfig
 logger = logging.getLogger(__name__)
 
 
+def normalize_collection_name(thread_id: str) -> str:
+    """
+    规范化collection名称，确保符合ChromaDB命名规范。
+    
+    Args:
+        thread_id: 线程ID或对话ID
+        
+    Returns:
+        规范化后的collection名称
+    """
+    import re
+    # 移除或替换特殊字符，只保留字母、数字、下划线和连字符
+    # ChromaDB collection名称应该只包含字母、数字、下划线和连字符
+    normalized = re.sub(r'[^a-zA-Z0-9_-]', '_', str(thread_id))
+    # 确保不以数字开头（避免某些数据库限制）
+    if normalized and normalized[0].isdigit():
+        normalized = f"thread_{normalized}"
+    # 确保长度合理
+    if len(normalized) > 100:
+        normalized = normalized[:100]
+    return normalized
+
+
+def get_collection_name(thread_id: Optional[str] = None) -> str:
+    """
+    获取collection名称。
+    
+    Args:
+        thread_id: 线程ID，如果为None则返回默认名称
+        
+    Returns:
+        Collection名称
+    """
+    if thread_id is None:
+        return "pubmed_articles"
+    normalized_thread_id = normalize_collection_name(thread_id)
+    return f"pubmed_articles_{normalized_thread_id}"
+
+
 class VectorDB(ABC):
     """向量数据库抽象接口"""
     
@@ -39,12 +78,13 @@ class VectorDB(ABC):
 class ChromaVectorDB(VectorDB):
     """ChromaDB向量数据库实现"""
     
-    def __init__(self, config: AgentConfig):
+    def __init__(self, config: AgentConfig, collection_name: Optional[str] = None):
         """
         初始化ChromaDB向量数据库。
         
         Args:
             config: Agent配置对象
+            collection_name: Collection名称，如果为None则使用默认名称"pubmed_articles"
         """
         self.config = config
         
@@ -86,13 +126,17 @@ class ChromaVectorDB(VectorDB):
             settings=Settings(anonymized_telemetry=False)
         )
         
+        # 确定collection名称，默认使用"pubmed_articles"（向后兼容）
+        if collection_name is None:
+            collection_name = "pubmed_articles"
+        
         # 创建或获取集合
         self.collection = self.client.get_or_create_collection(
-            name="pubmed_articles",
+            name=collection_name,
             metadata={"hnsw:space": "cosine"}  # 使用余弦相似度
         )
         
-        logger.info(f"Initialized ChromaDB vector database at {config.chroma_persist_directory}")
+        logger.info(f"Initialized ChromaDB vector database at {config.chroma_persist_directory} with collection: {collection_name}")
     
     def store(self, texts: List[str], metadatas: List[Dict[str, Any]], ids: List[str]) -> bool:
         """
@@ -191,18 +235,19 @@ class ChromaVectorDB(VectorDB):
             return False
 
 
-def create_vector_db(config: AgentConfig) -> VectorDB:
+def create_vector_db(config: AgentConfig, collection_name: Optional[str] = None) -> VectorDB:
     """
     创建向量数据库实例。
     
     Args:
         config: Agent配置对象
+        collection_name: Collection名称，如果为None则使用默认名称"pubmed_articles"
         
     Returns:
         向量数据库实例
     """
     if config.vector_db_type == "chroma":
-        return ChromaVectorDB(config)
+        return ChromaVectorDB(config, collection_name=collection_name)
     else:
         raise ValueError(f"Unsupported vector database type: {config.vector_db_type}")
 

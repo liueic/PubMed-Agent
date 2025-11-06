@@ -8,7 +8,7 @@ from typing import List, Optional
 from langchain.tools import BaseTool
 from langchain_core.tools import tool
 from .config import AgentConfig
-from .vector_db import create_vector_db
+from .vector_db import create_vector_db, get_collection_name
 from .utils import chunk_text, PubMedRateLimiter, parse_pubmed_date
 
 logger = logging.getLogger(__name__)
@@ -52,17 +52,46 @@ class PubMedSearchTool(BaseTool):
                 return f"Error: biopython is required for PubMed search. Please install it: pip install biopython"
             
             # 设置 NCBI Entrez 参数
+            # NCBI要求提供真实的email地址，强烈建议配置
             if self.config.pubmed_email:
-                Entrez.email = self.config.pubmed_email
+                email = self.config.pubmed_email.strip()
+                # 检查是否是假邮箱
+                if email == "pubmed_agent@example.com" or "@example.com" in email.lower():
+                    logger.warning(
+                        "⚠️  检测到使用了示例邮箱地址。NCBI要求提供真实的email地址。"
+                        "请设置环境变量 PUBMED_EMAIL 或在配置中提供您的真实邮箱。"
+                        "获取帮助：https://www.ncbi.nlm.nih.gov/account/register/"
+                    )
+                Entrez.email = email
             else:
-                # NCBI 要求提供 email，如果未配置则使用默认值
-                Entrez.email = "pubmed_agent@example.com"
+                # 未配置email时给出严重警告
+                default_email = "pubmed_agent@example.com"
+                logger.warning(
+                    "警告：未配置 PUBMED_EMAIL 环境变量。"
+                    "NCBI要求提供真实的email地址以符合使用政策。"
+                    "当前使用临时邮箱，可能导致API访问受限。"
+                    "请设置环境变量 PUBMED_EMAIL=your_email@example.com"
+                    "或在配置文件中提供您的真实邮箱。"
+                )
+                Entrez.email = default_email
             
             if self.config.pubmed_tool_name:
                 Entrez.tool = self.config.pubmed_tool_name
+            else:
+                Entrez.tool = "pubmed_agent"
             
+            # 设置API key（可选，但强烈推荐以提升速率限制）
             if self.config.pubmed_api_key:
-                Entrez.api_key = self.config.pubmed_api_key
+                Entrez.api_key = self.config.pubmed_api_key.strip()
+                logger.info("✅ 已配置PubMed API Key，速率限制已提升（10次/秒）")
+            else:
+                logger.warning(
+                    "ℹ️  未配置 PUBMED_API_KEY。"
+                    "当前速率限制为3次/秒。"
+                    "配置API Key可将速率限制提升至10次/秒。"
+                    "获取方式：登录NCBI账户 -> 我的NCBI -> API密钥"
+                    "设置环境变量：PUBMED_API_KEY=your_api_key"
+                )
             
             # 使用速率限制器
             self._rate_limiter.wait_if_needed()
@@ -89,11 +118,12 @@ class PubMedSearchTool(BaseTool):
             self._rate_limiter.wait_if_needed()
             
             # 批量获取文章详情
+            # 使用 medline 格式获取更全面的信息（包括DOI、MeSH、关键词等）
             pmid_string = ",".join(pmids)
             fetch_handle = Entrez.efetch(
                 db="pubmed",
                 id=pmid_string,
-                rettype="abstract",
+                rettype="medline",  # 使用medline格式获取更全面的元数据
                 retmode="xml"
             )
             
@@ -110,7 +140,7 @@ class PubMedSearchTool(BaseTool):
                 # 如果 XML 解析失败，尝试返回基本 PMID 信息
                 return f"Found {len(pmids)} article(s) for query: {query}\n" + "\n".join([f"[PMID:{pmid}]" for pmid in pmids[:10]])
             
-            # 提取文章信息
+            # 提取文章信息（增强版，提取更全面的字段）
             articles = []
             for article in root.findall(".//PubmedArticle"):
                 try:
@@ -122,68 +152,232 @@ class PubMedSearchTool(BaseTool):
                     title_elem = article.find(".//ArticleTitle")
                     title = title_elem.text if title_elem is not None else "No title"
                     
-                    # 提取作者（前 3 个）
+                    # 提取完整作者列表（不再限制为前3个）
                     authors = []
                     author_list = article.find(".//AuthorList")
                     if author_list is not None:
-                        for author in list(author_list)[:3]:
+                        for author in author_list:
                             last_name = author.find("LastName")
                             first_name = author.find("ForeName")
+                            initials = author.find("Initials")
                             if last_name is not None and last_name.text:
                                 author_name = last_name.text
                                 if first_name is not None and first_name.text:
                                     author_name += f" {first_name.text}"
+                                elif initials is not None and initials.text:
+                                    author_name += f" {initials.text}"
                                 authors.append(author_name)
                     
-                    # 提取期刊
+                    # 提取期刊信息
                     journal_elem = article.find(".//Journal/Title")
                     journal = journal_elem.text if journal_elem is not None else "Unknown journal"
                     
-                    # 提取发表年份
+                    # 提取期刊ISO缩写
+                    journal_iso = article.find(".//Journal/ISOAbbreviation")
+                    journal_iso_text = journal_iso.text if journal_iso is not None else None
+                    
+                    # 提取更详细的出版日期
                     pub_date_elem = article.find(".//PubDate")
                     pub_year = "Unknown"
+                    pub_month = ""
+                    pub_day = ""
                     if pub_date_elem is not None:
                         year_elem = pub_date_elem.find("Year")
+                        month_elem = pub_date_elem.find("Month")
+                        day_elem = pub_date_elem.find("Day")
                         if year_elem is not None:
                             pub_year = year_elem.text
+                        if month_elem is not None:
+                            pub_month = month_elem.text
+                        if day_elem is not None:
+                            pub_day = day_elem.text
                     
-                    # 提取摘要
-                    abstract_elem = article.find(".//AbstractText")
-                    abstract = ""
-                    if abstract_elem is not None:
-                        abstract = abstract_elem.text if abstract_elem.text else ""
-                        # 限制摘要长度
-                        if len(abstract) > 300:
-                            abstract = abstract[:300] + "..."
+                    # 构建完整的出版日期字符串
+                    pub_date_parts = [pub_year]
+                    if pub_month:
+                        pub_date_parts.append(pub_month)
+                    if pub_day:
+                        pub_date_parts.append(pub_day)
+                    publication_date = "-".join(pub_date_parts) if pub_date_parts else "Unknown"
                     
-                    articles.append({
+                    # 提取卷号、期号、页码
+                    volume_elem = article.find(".//JournalIssue/Volume")
+                    issue_elem = article.find(".//JournalIssue/Issue")
+                    pagination_elem = article.find(".//Pagination/MedlinePgn")
+                    volume = volume_elem.text if volume_elem is not None else None
+                    issue = issue_elem.text if issue_elem is not None else None
+                    pages = pagination_elem.text if pagination_elem is not None else None
+                    
+                    # 提取完整摘要（支持多个AbstractText部分）
+                    abstract_parts = []
+                    abstract_elem_list = article.findall(".//Abstract/AbstractText")
+                    if abstract_elem_list:
+                        for abs_elem in abstract_elem_list:
+                            if abs_elem.text:
+                                # 检查是否有Label属性（如Background, Methods, Results, Conclusion）
+                                label = abs_elem.get("Label", "")
+                                text = abs_elem.text.strip()
+                                if label:
+                                    abstract_parts.append(f"{label}: {text}")
+                                else:
+                                    abstract_parts.append(text)
+                    # 如果没有结构化摘要，尝试获取简单的AbstractText
+                    if not abstract_parts:
+                        simple_abstract = article.find(".//AbstractText")
+                        if simple_abstract is not None and simple_abstract.text:
+                            abstract_parts.append(simple_abstract.text.strip())
+                    
+                    abstract = " ".join(abstract_parts) if abstract_parts else ""
+                    
+                    # 提取DOI
+                    doi = None
+                    article_id_list = article.findall(".//ArticleIdList/ArticleId")
+                    for article_id in article_id_list:
+                        if article_id.get("IdType") == "doi":
+                            doi = article_id.text
+                            break
+                    
+                    # 提取PMC ID（如果可用）
+                    pmc_id = None
+                    for article_id in article_id_list:
+                        if article_id.get("IdType") == "pmc":
+                            pmc_id = article_id.text
+                            break
+                    
+                    # 提取MeSH术语
+                    mesh_terms = []
+                    mesh_list = article.findall(".//MeshHeadingList/MeshHeading")
+                    for mesh_heading in mesh_list:
+                        descriptor = mesh_heading.find("DescriptorName")
+                        if descriptor is not None and descriptor.text:
+                            mesh_terms.append(descriptor.text)
+                    
+                    # 提取关键词（如果可用）
+                    keywords = []
+                    keyword_list = article.findall(".//KeywordList/Keyword")
+                    for keyword in keyword_list:
+                        if keyword.text:
+                            keywords.append(keyword.text)
+                    
+                    # 提取文章类型
+                    publication_types = []
+                    pub_type_list = article.findall(".//PublicationTypeList/PublicationType")
+                    for pub_type in pub_type_list:
+                        if pub_type.text:
+                            publication_types.append(pub_type.text)
+                    
+                    # 提取语言
+                    language_list = article.findall(".//Language")
+                    languages = [lang.text for lang in language_list if lang.text]
+                    language = languages[0] if languages else "Unknown"
+                    
+                    # 构建文章信息字典
+                    article_info = {
                         "pmid": pmid,
                         "title": title,
                         "authors": authors,
+                        "author_count": len(authors),
                         "journal": journal,
+                        "journal_iso": journal_iso_text,
+                        "publication_date": publication_date,
                         "year": pub_year,
-                        "abstract": abstract
-                    })
+                        "volume": volume,
+                        "issue": issue,
+                        "pages": pages,
+                        "abstract": abstract,
+                        "abstract_length": len(abstract),
+                        "doi": doi,
+                        "pmc_id": pmc_id,
+                        "mesh_terms": mesh_terms,
+                        "keywords": keywords,
+                        "publication_types": publication_types,
+                        "language": language
+                    }
+                    
+                    articles.append(article_info)
                 except Exception as e:
-                    logger.warning(f"Error parsing article: {e}")
+                    logger.warning(f"Error parsing article: {e}", exc_info=True)
                     continue
             
-            # 格式化输出
+            # 格式化输出（增强版，展示更全面的信息）
             if not articles:
                 return f"Found {len(pmids)} article(s) but failed to parse details for query: {query}"
             
             result_lines = [f"Found {len(articles)} article(s) for query: {query}\n"]
             
             for article in articles:
+                # 标题和PMID
                 result_lines.append(f"[PMID:{article['pmid']}] {article['title']}")
+                
+                # 作者信息
                 if article['authors']:
-                    authors_str = ", ".join(article['authors'])
-                    if len(article['authors']) == 3:
-                        authors_str += " et al."
+                    # 显示前5个作者，如果超过5个则显示"et al."
+                    if len(article['authors']) <= 5:
+                        authors_str = ", ".join(article['authors'])
+                    else:
+                        authors_str = ", ".join(article['authors'][:5]) + f" et al. ({article['author_count']} authors)"
                     result_lines.append(f"Authors: {authors_str}")
-                result_lines.append(f"Journal: {article['journal']}, {article['year']}")
-                if article['abstract']:
-                    result_lines.append(f"Abstract: {article['abstract']}")
+                
+                # 期刊和出版信息
+                journal_info = f"Journal: {article['journal']}"
+                if article.get('journal_iso'):
+                    journal_info += f" ({article['journal_iso']})"
+                
+                # 添加卷、期、页信息
+                pub_info_parts = [article.get('year', 'Unknown')]
+                if article.get('volume'):
+                    pub_info_parts.append(f"Vol.{article['volume']}")
+                if article.get('issue'):
+                    pub_info_parts.append(f"Issue {article['issue']}")
+                if article.get('pages'):
+                    pub_info_parts.append(f"pp.{article['pages']}")
+                
+                journal_info += f" ({', '.join(pub_info_parts)})"
+                result_lines.append(journal_info)
+                
+                # DOI和PMC ID
+                id_info = []
+                if article.get('doi'):
+                    id_info.append(f"DOI: {article['doi']}")
+                if article.get('pmc_id'):
+                    id_info.append(f"PMC: {article['pmc_id']}")
+                if id_info:
+                    result_lines.append(", ".join(id_info))
+                
+                # 文章类型和语言
+                meta_info = []
+                if article.get('publication_types'):
+                    meta_info.append(f"Type: {', '.join(article['publication_types'])}")
+                if article.get('language') and article['language'] != 'Unknown':
+                    meta_info.append(f"Language: {article['language']}")
+                if meta_info:
+                    result_lines.append(" | ".join(meta_info))
+                
+                # MeSH术语（显示前5个）
+                if article.get('mesh_terms'):
+                    mesh_display = article['mesh_terms'][:5]
+                    mesh_str = ", ".join(mesh_display)
+                    if len(article['mesh_terms']) > 5:
+                        mesh_str += f" (+{len(article['mesh_terms']) - 5} more)"
+                    result_lines.append(f"MeSH Terms: {mesh_str}")
+                
+                # 关键词（如果可用）
+                if article.get('keywords'):
+                    keywords_display = article['keywords'][:5]
+                    keywords_str = ", ".join(keywords_display)
+                    if len(article['keywords']) > 5:
+                        keywords_str += f" (+{len(article['keywords']) - 5} more)"
+                    result_lines.append(f"Keywords: {keywords_str}")
+                
+                # 摘要（完整摘要，不截断）
+                if article.get('abstract'):
+                    abstract = article['abstract']
+                    # 如果摘要太长，在显示时可以截断，但保留完整信息用于存储
+                    display_abstract = abstract
+                    if len(abstract) > 1000:  # 显示时如果超过1000字符则截断并提示
+                        display_abstract = abstract[:1000] + f"... (完整摘要共{len(abstract)}字符)"
+                    result_lines.append(f"Abstract: {display_abstract}")
+                
                 result_lines.append("")  # 空行分隔
             
             return "\n".join(result_lines)
@@ -211,23 +405,38 @@ class VectorDBStoreTool(BaseTool):
     # 使用类级别的变量存储配置和向量数据库
     _config: Optional[AgentConfig] = None
     _vector_db = None
+    _thread_id_getter = None
     
-    def __init__(self, config: Optional[AgentConfig] = None, **kwargs):
-        """Initialize the vector storage tool."""
+    def __init__(self, config: Optional[AgentConfig] = None, thread_id_getter=None, **kwargs):
+        """
+        Initialize the vector storage tool.
+        
+        Args:
+            config: Agent配置对象
+            thread_id_getter: 用于获取当前thread_id的函数，如果为None则使用默认collection
+        """
         super().__init__(**kwargs)
         # 使用私有属性存储，避免Pydantic验证错误
         object.__setattr__(self, '_config', config or AgentConfig())
-        object.__setattr__(self, '_vector_db', create_vector_db(self._config))
+        object.__setattr__(self, '_thread_id_getter', thread_id_getter)
+        # 不在这里创建vector_db，而是在运行时根据thread_id动态创建
     
     @property
     def config(self) -> AgentConfig:
         """Get the configuration."""
         return self._config
     
-    @property
-    def vector_db(self):
-        """Get the vector database."""
-        return self._vector_db
+    def _get_vector_db(self):
+        """动态获取向量数据库实例，根据当前thread_id创建对应的collection"""
+        thread_id = None
+        if self._thread_id_getter:
+            try:
+                thread_id = self._thread_id_getter()
+            except Exception as e:
+                logger.warning(f"Failed to get thread_id: {e}, using default collection")
+        
+        collection_name = get_collection_name(thread_id)
+        return create_vector_db(self._config, collection_name=collection_name)
     
     def _run(self, input_data: str) -> str:
         """
@@ -240,19 +449,44 @@ class VectorDBStoreTool(BaseTool):
         try:
             import json
             
-            # 尝试解析JSON格式
+            # 尝试解析JSON格式（支持增强的字段）
             try:
+                # 首先检查input_data是否为字符串
+                if not isinstance(input_data, str):
+                    # 如果不是字符串，尝试转换为字符串
+                    input_data = str(input_data)
+                
                 data = json.loads(input_data)
+                
+                # 检查解析结果是否为字典类型
+                if not isinstance(data, dict):
+                    # 如果解析结果是整数或其他非字典类型（例如JSON数字），按PMID字符串处理
+                    pmid = str(data).strip()
+                    logger.warning(f"JSON解析结果为非字典类型，按PMID处理: {pmid}")
+                    return f"Note: Storage for PMID {pmid} requires article content. Please provide article data in JSON format."
+                
+                # 确保data是字典后才调用.get()方法
                 pmid = data.get("pmid") or data.get("PMID")
                 title = data.get("title", "")
                 abstract = data.get("abstract", "") or data.get("Abstract", "")
                 authors = data.get("authors", []) or data.get("Authors", [])
                 journal = data.get("journal", "") or data.get("Journal", "")
                 publication_date = data.get("publication_date", "") or data.get("PublicationDate", "")
+                # 提取新增字段
+                doi = data.get("doi", "")
+                pmc_id = data.get("pmc_id", "")
+                mesh_terms = data.get("mesh_terms", []) or data.get("MeSH", [])
+                keywords = data.get("keywords", []) or data.get("Keywords", [])
+                publication_types = data.get("publication_types", []) or data.get("PublicationTypes", [])
+                language = data.get("language", "")
+                volume = data.get("volume", "")
+                issue = data.get("issue", "")
+                pages = data.get("pages", "")
+                journal_iso = data.get("journal_iso", "")
             except json.JSONDecodeError:
                 # 如果不是JSON，假设是PMID字符串，需要从其他地方获取文章内容
                 # 这里暂时返回占位符，实际实现需要调用PubMed API
-                pmid = input_data.strip()
+                pmid = input_data.strip() if isinstance(input_data, str) else str(input_data).strip()
                 logger.warning(f"PMID only provided, but article content fetching not implemented yet: {pmid}")
                 return f"Note: Storage for PMID {pmid} requires article content. Please provide article data in JSON format."
             
@@ -262,8 +496,17 @@ class VectorDBStoreTool(BaseTool):
             if not abstract and not title:
                 return f"Error: Article content (title or abstract) is required for PMID {pmid}"
             
-            # 准备文本内容
-            full_text = f"{title}\n\n{abstract}".strip()
+            # 准备文本内容（包含标题、摘要、MeSH术语和关键词以增强语义搜索）
+            text_parts = [title]
+            if abstract:
+                text_parts.append(abstract)
+            # 添加MeSH术语和关键词以增强检索能力
+            if mesh_terms:
+                text_parts.append(f"MeSH Terms: {', '.join(mesh_terms[:10])}")  # 限制数量
+            if keywords:
+                text_parts.append(f"Keywords: {', '.join(keywords[:10])}")  # 限制数量
+            
+            full_text = "\n\n".join(text_parts).strip()
             
             # 分块处理长文本
             chunks = chunk_text(full_text, chunk_size=self.config.chunk_size, overlap=self.config.chunk_overlap)
@@ -271,14 +514,15 @@ class VectorDBStoreTool(BaseTool):
             if not chunks:
                 return f"Error: No valid text content to store for PMID {pmid}"
             
-            # 准备元数据
+            # 准备元数据（包含所有可用字段）
             texts = []
             metadatas = []
             ids = []
             
             for i, chunk in enumerate(chunks):
                 texts.append(chunk)
-                metadatas.append({
+                # 构建完整的元数据字典
+                metadata = {
                     "pmid": pmid,
                     "title": title,
                     "chunk_index": i,
@@ -286,11 +530,35 @@ class VectorDBStoreTool(BaseTool):
                     "authors": ", ".join(authors) if authors else "",
                     "journal": journal,
                     "publication_date": publication_date
-                })
+                }
+                # 添加可选字段（如果存在）
+                if doi:
+                    metadata["doi"] = doi
+                if pmc_id:
+                    metadata["pmc_id"] = pmc_id
+                if journal_iso:
+                    metadata["journal_iso"] = journal_iso
+                if volume:
+                    metadata["volume"] = volume
+                if issue:
+                    metadata["issue"] = issue
+                if pages:
+                    metadata["pages"] = pages
+                if language:
+                    metadata["language"] = language
+                if mesh_terms:
+                    metadata["mesh_terms"] = ", ".join(mesh_terms[:20])  # 存储前20个MeSH术语
+                if keywords:
+                    metadata["keywords"] = ", ".join(keywords[:20])  # 存储前20个关键词
+                if publication_types:
+                    metadata["publication_types"] = ", ".join(publication_types)
+                
+                metadatas.append(metadata)
                 ids.append(f"{pmid}_chunk_{i}")
             
-            # 存储到向量数据库
-            success = self.vector_db.store(texts=texts, metadatas=metadatas, ids=ids)
+            # 存储到向量数据库（动态获取对应的collection）
+            vector_db = self._get_vector_db()
+            success = vector_db.store(texts=texts, metadatas=metadatas, ids=ids)
             
             if success:
                 return f"Successfully stored article with PMID {pmid} ({len(chunks)} chunks)"
@@ -319,23 +587,38 @@ class VectorSearchTool(BaseTool):
     # 使用类级别的变量存储配置和向量数据库
     _config: Optional[AgentConfig] = None
     _vector_db = None
+    _thread_id_getter = None
     
-    def __init__(self, config: Optional[AgentConfig] = None, **kwargs):
-        """Initialize the vector search tool."""
+    def __init__(self, config: Optional[AgentConfig] = None, thread_id_getter=None, **kwargs):
+        """
+        Initialize the vector search tool.
+        
+        Args:
+            config: Agent配置对象
+            thread_id_getter: 用于获取当前thread_id的函数，如果为None则使用默认collection
+        """
         super().__init__(**kwargs)
         # 使用私有属性存储，避免Pydantic验证错误
         object.__setattr__(self, '_config', config or AgentConfig())
-        object.__setattr__(self, '_vector_db', create_vector_db(self._config))
+        object.__setattr__(self, '_thread_id_getter', thread_id_getter)
+        # 不在这里创建vector_db，而是在运行时根据thread_id动态创建
     
     @property
     def config(self) -> AgentConfig:
         """Get the configuration."""
         return self._config
     
-    @property
-    def vector_db(self):
-        """Get the vector database."""
-        return self._vector_db
+    def _get_vector_db(self):
+        """动态获取向量数据库实例，根据当前thread_id创建对应的collection"""
+        thread_id = None
+        if self._thread_id_getter:
+            try:
+                thread_id = self._thread_id_getter()
+            except Exception as e:
+                logger.warning(f"Failed to get thread_id: {e}, using default collection")
+        
+        collection_name = get_collection_name(thread_id)
+        return create_vector_db(self._config, collection_name=collection_name)
     
     def _run(self, query: str) -> str:
         """Execute vector search."""
@@ -343,8 +626,9 @@ class VectorSearchTool(BaseTool):
             if not query or not query.strip():
                 return "Error: Search query is required"
             
-            # 执行搜索
-            results = self.vector_db.search(
+            # 执行搜索（动态获取对应的collection）
+            vector_db = self._get_vector_db()
+            results = vector_db.search(
                 query=query,
                 n_results=self.config.max_retrieve_results
             )
@@ -385,19 +669,20 @@ class VectorSearchTool(BaseTool):
         return self._run(query)
 
 
-def create_tools(config: AgentConfig) -> List[BaseTool]:
+def create_tools(config: AgentConfig, thread_id_getter=None) -> List[BaseTool]:
     """
     Create all tools for the agent.
     
     Args:
         config: Agent configuration
+        thread_id_getter: 用于获取当前thread_id的函数，如果为None则使用默认collection
         
     Returns:
         List of tools
     """
     return [
         PubMedSearchTool(config=config),
-        VectorDBStoreTool(config=config),
-        VectorSearchTool(config=config)
+        VectorDBStoreTool(config=config, thread_id_getter=thread_id_getter),
+        VectorSearchTool(config=config, thread_id_getter=thread_id_getter)
     ]
 
