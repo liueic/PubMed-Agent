@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def print_response(response: dict, verbose: bool = False):
-    """格式化打印响应"""
+    """格式化打印响应，并自动保存为Markdown文档"""
     if not response.get('success', False):
         error_msg = response.get('error', 'Unknown error')
         error_details = response.get('error_details', {})
@@ -60,6 +60,16 @@ def print_response(response: dict, verbose: bool = False):
                 print(error_details['details'])
         
         print("=" * 80)
+        
+        # 保存错误响应为Markdown
+        try:
+            from .output_utils import save_response_to_markdown
+            saved_path = save_response_to_markdown(response)
+            print(f"💾 结果已保存到 / Result saved to: {saved_path}")
+            print()
+        except Exception as e:
+            logger.warning(f"保存Markdown文档时出错 / Error saving Markdown: {e}")
+        
         return
     
     print("\n" + "=" * 80)
@@ -72,26 +82,36 @@ def print_response(response: dict, verbose: bool = False):
         print(f"\n语言 / Language: {response.get('language', 'unknown')}")
         print(f"提示词类型 / Prompt Type: {response.get('prompt_type', 'unknown')}")
         print(f"推理步骤数 / Reasoning Steps: {len(response.get('intermediate_steps', []))}")
+    
+    # 自动保存为Markdown文档
+    try:
+        from .output_utils import save_response_to_markdown
+        saved_path = save_response_to_markdown(response)
+        print(f"\n💾 结果已保存到 / Result saved to: {saved_path}")
+        print()
+    except Exception as e:
+        logger.warning(f"保存Markdown文档时出错 / Error saving Markdown: {e}")
 
 
 def query_command(args):
     """处理查询命令"""
     try:
-        # 创建配置
+        # 创建配置（优先使用环境变量，命令行参数会覆盖）
         config = None
-        if args.api_base:
-            config = AgentConfig(
-                openai_api_key=os.getenv("OPENAI_API_KEY", args.api_key or ""),
-                openai_api_base=args.api_base,
-                openai_model=args.model or os.getenv("OPENAI_MODEL", "gpt-4o")
-            )
-        elif args.api_key:
-            config = AgentConfig(
-                openai_api_key=args.api_key,
-                openai_model=args.model or os.getenv("OPENAI_MODEL", "gpt-4o")
-            )
+        if args.api_base or args.api_key or args.model:
+            # 如果提供了命令行参数，手动创建配置
+            llm_api_key = args.api_key or os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+            config_kwargs = {}
+            if llm_api_key:
+                config_kwargs["llm_api_key"] = llm_api_key
+            if args.api_base:
+                config_kwargs["llm_base_url"] = args.api_base
+            if args.model:
+                config_kwargs["llm_model"] = args.model
+            if config_kwargs:
+                config = AgentConfig(**config_kwargs)
         
-        # 创建agent
+        # 创建agent（如果 config 为 None，AgentConfig 会自动从环境变量读取）
         agent = PubMedAgent(config=config, language=args.language)
         
         # 执行查询
@@ -114,21 +134,22 @@ def query_command(args):
 def search_command(args):
     """处理搜索命令"""
     try:
-        # 创建配置
+        # 创建配置（优先使用环境变量，命令行参数会覆盖）
         config = None
-        if args.api_base:
-            config = AgentConfig(
-                openai_api_key=os.getenv("OPENAI_API_KEY", args.api_key or ""),
-                openai_api_base=args.api_base,
-                openai_model=args.model or os.getenv("OPENAI_MODEL", "gpt-4o")
-            )
-        elif args.api_key:
-            config = AgentConfig(
-                openai_api_key=args.api_key,
-                openai_model=args.model or os.getenv("OPENAI_MODEL", "gpt-4o")
-            )
+        if args.api_base or args.api_key or args.model:
+            # 如果提供了命令行参数，手动创建配置
+            llm_api_key = args.api_key or os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+            config_kwargs = {}
+            if llm_api_key:
+                config_kwargs["llm_api_key"] = llm_api_key
+            if args.api_base:
+                config_kwargs["llm_base_url"] = args.api_base
+            if args.model:
+                config_kwargs["llm_model"] = args.model
+            if config_kwargs:
+                config = AgentConfig(**config_kwargs)
         
-        # 创建agent
+        # 创建agent（如果 config 为 None，AgentConfig 会自动从环境变量读取）
         agent = PubMedAgent(config=config, language=args.language)
         
         # 执行搜索
@@ -199,21 +220,22 @@ def _get_current_log_level() -> str:
 def interactive_command(args):
     """交互式模式"""
     try:
-        # 创建配置
+        # 创建配置（优先使用环境变量，命令行参数会覆盖）
         config = None
-        if args.api_base:
-            config = AgentConfig(
-                openai_api_key=os.getenv("OPENAI_API_KEY", args.api_key or ""),
-                openai_api_base=args.api_base,
-                openai_model=args.model or os.getenv("OPENAI_MODEL", "gpt-4o")
-            )
-        elif args.api_key:
-            config = AgentConfig(
-                openai_api_key=args.api_key,
-                openai_model=args.model or os.getenv("OPENAI_MODEL", "gpt-4o")
-            )
+        if args.api_base or args.api_key or args.model:
+            # 如果提供了命令行参数，手动创建配置
+            llm_api_key = args.api_key or os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+            config_kwargs = {}
+            if llm_api_key:
+                config_kwargs["llm_api_key"] = llm_api_key
+            if args.api_base:
+                config_kwargs["llm_base_url"] = args.api_base
+            if args.model:
+                config_kwargs["llm_model"] = args.model
+            if config_kwargs:
+                config = AgentConfig(**config_kwargs)
         
-        # 创建agent
+        # 创建agent（如果 config 为 None，AgentConfig 会自动从环境变量读取）
         agent = PubMedAgent(config=config, language=args.language)
         
         # 开始新的对话会话，保持多轮对话上下文
@@ -359,21 +381,22 @@ def interactive_command(args):
 def stats_command(args):
     """显示统计信息"""
     try:
-        # 创建配置
+        # 创建配置（优先使用环境变量，命令行参数会覆盖）
         config = None
-        if args.api_base:
-            config = AgentConfig(
-                openai_api_key=os.getenv("OPENAI_API_KEY", args.api_key or ""),
-                openai_api_base=args.api_base,
-                openai_model=args.model or os.getenv("OPENAI_MODEL", "gpt-4o")
-            )
-        elif args.api_key:
-            config = AgentConfig(
-                openai_api_key=args.api_key,
-                openai_model=args.model or os.getenv("OPENAI_MODEL", "gpt-4o")
-            )
+        if args.api_base or args.api_key or args.model:
+            # 如果提供了命令行参数，手动创建配置
+            llm_api_key = args.api_key or os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+            config_kwargs = {}
+            if llm_api_key:
+                config_kwargs["llm_api_key"] = llm_api_key
+            if args.api_base:
+                config_kwargs["llm_base_url"] = args.api_base
+            if args.model:
+                config_kwargs["llm_model"] = args.model
+            if config_kwargs:
+                config = AgentConfig(**config_kwargs)
         
-        # 创建agent
+        # 创建agent（如果 config 为 None，AgentConfig 会自动从环境变量读取）
         agent = PubMedAgent(config=config, language=args.language)
         
         # 获取统计信息
@@ -509,11 +532,12 @@ def main():
     detailed = getattr(args, 'verbose', False)
     setup_logging(log_level=log_level, log_file=log_file, detailed=detailed)
     
-    # 检查API密钥
-    if not args.api_key and not os.getenv("OPENAI_API_KEY"):
+    # 检查API密钥（支持 LLM_API_KEY 和 OPENAI_API_KEY）
+    llm_api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not args.api_key and not llm_api_key:
         print("❌ 错误 / Error: 未找到API密钥 / API key not found")
-        print("请设置环境变量 OPENAI_API_KEY 或使用 --api-key 参数")
-        print("Please set OPENAI_API_KEY environment variable or use --api-key argument")
+        print("请设置环境变量 LLM_API_KEY 或 OPENAI_API_KEY，或使用 --api-key 参数")
+        print("Please set LLM_API_KEY or OPENAI_API_KEY environment variable, or use --api-key argument")
         sys.exit(1)
     
     # 执行对应命令

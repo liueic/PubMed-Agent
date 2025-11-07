@@ -7,12 +7,14 @@ import logging
 import json
 import threading
 import time
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 from langchain.tools import BaseTool
 from langchain_core.tools import tool
 from .config import AgentConfig
+from pubmed_mcp import PubMedMCPClient
 from .vector_db import create_vector_db, get_collection_name
-from .utils import chunk_text, PubMedRateLimiter, parse_pubmed_date
+from .utils import chunk_text, parse_pubmed_date
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,22 @@ _vector_db_cache: Dict[str, Any] = {}
 _vector_db_cache_lock = threading.Lock()
 # 向量数据库缓存大小限制（最多缓存50个实例）
 _vector_db_cache_max_size = 50
+
+
+_mcp_client_instance: Optional[PubMedMCPClient] = None
+_mcp_client_lock = threading.Lock()
+
+
+def _get_mcp_client(config: AgentConfig) -> PubMedMCPClient:
+    """Get a singleton MCP client configured for the current environment."""
+
+    global _mcp_client_instance
+    if _mcp_client_instance is None:
+        with _mcp_client_lock:
+            if _mcp_client_instance is None:
+                base_path = Path(config.pubmed_mcp_base_dir).resolve()
+                _mcp_client_instance = PubMedMCPClient(base_path=base_path)
+    return _mcp_client_instance
 
 
 def clear_vector_db_cache() -> int:
@@ -241,7 +259,6 @@ class PubMedSearchTool(BaseTool):
         super().__init__(**kwargs)
         # 使用私有属性存储，避免Pydantic验证错误
         object.__setattr__(self, '_config', config or AgentConfig())
-        object.__setattr__(self, '_rate_limiter', PubMedRateLimiter(requests_per_second=3.0))
     
     @property
     def config(self) -> AgentConfig:
@@ -251,196 +268,9 @@ class PubMedSearchTool(BaseTool):
     def _run(self, query: str) -> str:
         """Execute PubMed search."""
         try:
-            # 导入 Bio.Entrez（延迟导入，避免在模块级别导入）
-            try:
-                from Bio import Entrez
-                from xml.etree import ElementTree as ET
-            except ImportError:
-                logger.error("Bio.Entrez is not available. Please install biopython: pip install biopython")
-                return f"Error: biopython is required for PubMed search. Please install it: pip install biopython"
-            
-            # 设置 NCBI Entrez 参数
-            # NCBI要求提供真实的email地址，强烈建议配置
-            if self.config.pubmed_email:
-                email = self.config.pubmed_email.strip()
-                # 检查是否是假邮箱
-                if email == "pubmed_agent@example.com" or "@example.com" in email.lower():
-                    logger.warning(
-                        "⚠️  检测到使用了示例邮箱地址。NCBI要求提供真实的email地址。"
-                        "请设置环境变量 PUBMED_EMAIL 或在配置中提供您的真实邮箱。"
-                        "获取帮助：https://www.ncbi.nlm.nih.gov/account/register/"
-                    )
-                Entrez.email = email
-            else:
-                # 未配置email时给出严重警告
-                default_email = "pubmed_agent@example.com"
-                logger.warning(
-                    "警告：未配置 PUBMED_EMAIL 环境变量。"
-                    "NCBI要求提供真实的email地址以符合使用政策。"
-                    "当前使用临时邮箱，可能导致API访问受限。"
-                    "请设置环境变量 PUBMED_EMAIL=your_email@example.com"
-                    "或在配置文件中提供您的真实邮箱。"
-                )
-                Entrez.email = default_email
-            
-            if self.config.pubmed_tool_name:
-                Entrez.tool = self.config.pubmed_tool_name
-            else:
-                Entrez.tool = "pubmed_agent"
-            
-            # 设置API key（可选，但强烈推荐以提升速率限制）
-            if self.config.pubmed_api_key:
-                Entrez.api_key = self.config.pubmed_api_key.strip()
-                logger.info("✅ 已配置PubMed API Key，速率限制已提升（10次/秒）")
-            else:
-                logger.warning(
-                    "ℹ️  未配置 PUBMED_API_KEY。"
-                    "当前速率限制为3次/秒。"
-                    "配置API Key可将速率限制提升至10次/秒。"
-                    "获取方式：登录NCBI账户 -> 我的NCBI -> API密钥"
-                    "设置环境变量：PUBMED_API_KEY=your_api_key"
-                )
-            
-            # 使用速率限制器
-            self._rate_limiter.wait_if_needed()
-            
-            # 搜索 PubMed
-            logger.info(f"Searching PubMed for: {query}")
-            search_handle = Entrez.esearch(
-                db="pubmed",
-                term=query,
-                retmax=20  # 默认返回 20 篇文章
-            )
-            search_results = Entrez.read(search_handle)
-            search_handle.close()
-            
-            # 获取 PMID 列表
-            pmids = search_results.get("IdList", [])
-            
-            if not pmids:
-                return f"No articles found for query: {query}"
-            
-            logger.info(f"Found {len(pmids)} articles, fetching details...")
-            
-            # 使用速率限制器
-            self._rate_limiter.wait_if_needed()
-            
-            # 批量获取文章详情
-            # 使用 medline 格式获取更全面的信息（包括DOI、MeSH、关键词等）
-            pmid_string = ",".join(pmids)
-            fetch_handle = Entrez.efetch(
-                db="pubmed",
-                id=pmid_string,
-                rettype="medline",  # 使用medline格式获取更全面的元数据
-                retmode="xml"
-            )
-            
-            # 解析 XML（efetch 返回的是 XML 格式）
-            try:
-                # 读取 XML 内容
-                xml_data = fetch_handle.read()
-                fetch_handle.close()
-                
-                # 解析 XML
-                root = ET.fromstring(xml_data)
-            except ET.ParseError as e:
-                logger.error(f"Error parsing XML: {e}")
-                # 如果 XML 解析失败，尝试返回基本 PMID 信息
-                return f"Found {len(pmids)} article(s) for query: {query}\n" + "\n".join([f"[PMID:{pmid}]" for pmid in pmids[:10]])
-            
-            # 提取文章信息（增强版，提取更全面的字段）
-            articles = []
-            for article in root.findall(".//PubmedArticle"):
-                article_info = _parse_pubmed_article_xml(article)
-                if article_info:
-                    # 添加额外的字段用于格式化输出
-                    article_info["author_count"] = len(article_info.get("authors", []))
-                    article_info["abstract_length"] = len(article_info.get("abstract", ""))
-                    articles.append(article_info)
-            
-            # 格式化输出（增强版，展示更全面的信息）
-            if not articles:
-                return f"Found {len(pmids)} article(s) but failed to parse details for query: {query}"
-            
-            result_lines = [f"Found {len(articles)} article(s) for query: {query}\n"]
-            
-            for article in articles:
-                # 标题和PMID
-                result_lines.append(f"[PMID:{article['pmid']}] {article['title']}")
-                
-                # 作者信息
-                if article['authors']:
-                    # 显示前5个作者，如果超过5个则显示"et al."
-                    if len(article['authors']) <= 5:
-                        authors_str = ", ".join(article['authors'])
-                    else:
-                        authors_str = ", ".join(article['authors'][:5]) + f" et al. ({article['author_count']} authors)"
-                    result_lines.append(f"Authors: {authors_str}")
-                
-                # 期刊和出版信息
-                journal_info = f"Journal: {article['journal']}"
-                if article.get('journal_iso'):
-                    journal_info += f" ({article['journal_iso']})"
-                
-                # 添加卷、期、页信息
-                pub_info_parts = [article.get('year', 'Unknown')]
-                if article.get('volume'):
-                    pub_info_parts.append(f"Vol.{article['volume']}")
-                if article.get('issue'):
-                    pub_info_parts.append(f"Issue {article['issue']}")
-                if article.get('pages'):
-                    pub_info_parts.append(f"pp.{article['pages']}")
-                
-                journal_info += f" ({', '.join(pub_info_parts)})"
-                result_lines.append(journal_info)
-                
-                # DOI和PMC ID
-                id_info = []
-                if article.get('doi'):
-                    id_info.append(f"DOI: {article['doi']}")
-                if article.get('pmc_id'):
-                    id_info.append(f"PMC: {article['pmc_id']}")
-                if id_info:
-                    result_lines.append(", ".join(id_info))
-                
-                # 文章类型和语言
-                meta_info = []
-                if article.get('publication_types'):
-                    meta_info.append(f"Type: {', '.join(article['publication_types'])}")
-                if article.get('language') and article['language'] != 'Unknown':
-                    meta_info.append(f"Language: {article['language']}")
-                if meta_info:
-                    result_lines.append(" | ".join(meta_info))
-                
-                # MeSH术语（显示前5个）
-                if article.get('mesh_terms'):
-                    mesh_display = article['mesh_terms'][:5]
-                    mesh_str = ", ".join(mesh_display)
-                    if len(article['mesh_terms']) > 5:
-                        mesh_str += f" (+{len(article['mesh_terms']) - 5} more)"
-                    result_lines.append(f"MeSH Terms: {mesh_str}")
-                
-                # 关键词（如果可用）
-                if article.get('keywords'):
-                    keywords_display = article['keywords'][:5]
-                    keywords_str = ", ".join(keywords_display)
-                    if len(article['keywords']) > 5:
-                        keywords_str += f" (+{len(article['keywords']) - 5} more)"
-                    result_lines.append(f"Keywords: {keywords_str}")
-                
-                # 摘要（完整摘要，不截断）
-                if article.get('abstract'):
-                    abstract = article['abstract']
-                    # 如果摘要太长，在显示时可以截断，但保留完整信息用于存储
-                    display_abstract = abstract
-                    if len(abstract) > 1000:  # 显示时如果超过1000字符则截断并提示
-                        display_abstract = abstract[:1000] + f"... (完整摘要共{len(abstract)}字符)"
-                    result_lines.append(f"Abstract: {display_abstract}")
-                
-                result_lines.append("")  # 空行分隔
-            
-            return "\n".join(result_lines)
-            
+            client = _get_mcp_client(self.config)
+            payload = client.search(query)
+            return json.dumps(payload, ensure_ascii=False, indent=2)
         except Exception as e:
             error_msg = f"Error searching PubMed: {str(e)}"
             logger.error(error_msg, exc_info=True)
@@ -464,16 +294,14 @@ class PubMedFetchTool(BaseTool):
         "Use this tool after selecting interesting articles from search results to get their complete information."
     )
     
-    # 使用类级别的变量存储配置和速率限制器
+    # 使用类级别的变量存储配置
     _config: Optional[AgentConfig] = None
-    _rate_limiter = None
     
     def __init__(self, config: Optional[AgentConfig] = None, **kwargs):
         """Initialize the PubMed fetch tool."""
         super().__init__(**kwargs)
         # 使用私有属性存储，避免Pydantic验证错误
         object.__setattr__(self, '_config', config or AgentConfig())
-        object.__setattr__(self, '_rate_limiter', PubMedRateLimiter(requests_per_second=3.0))
     
     @property
     def config(self) -> AgentConfig:
@@ -491,114 +319,26 @@ class PubMedFetchTool(BaseTool):
             JSON-formatted string containing article data, or error message
         """
         try:
-            # 导入 Bio.Entrez（延迟导入，避免在模块级别导入）
-            try:
-                from Bio import Entrez
-                from xml.etree import ElementTree as ET
-            except ImportError:
-                logger.error("Bio.Entrez is not available. Please install biopython: pip install biopython")
-                return json.dumps({
-                    "error": "biopython is required for PubMed fetch. Please install it: pip install biopython"
-                })
-            
-            # 清理PMID输入（移除可能的空格和非数字字符）
-            pmid = str(pmid).strip()
-            # 移除常见的PMID前缀（如"PMID:"）
-            if pmid.upper().startswith("PMID:"):
-                pmid = pmid[5:].strip()
-            
-            # 验证PMID格式（应该是1-8位数字）
-            if not pmid.isdigit() or len(pmid) > 8:
-                error_msg = f"Invalid PMID format: {pmid}. PMID should be 1-8 digits."
-                logger.warning(error_msg)
-                return json.dumps({"error": error_msg, "pmid": pmid})
-            
-            # 设置 NCBI Entrez 参数
-            if self.config.pubmed_email:
-                email = self.config.pubmed_email.strip()
-                if email == "pubmed_agent@example.com" or "@example.com" in email.lower():
-                    logger.warning(
-                        "⚠️  检测到使用了示例邮箱地址。NCBI要求提供真实的email地址。"
-                        "请设置环境变量 PUBMED_EMAIL 或在配置中提供您的真实邮箱。"
-                    )
-                Entrez.email = email
-            else:
-                default_email = "pubmed_agent@example.com"
-                logger.warning(
-                    "警告：未配置 PUBMED_EMAIL 环境变量。"
-                    "NCBI要求提供真实的email地址以符合使用政策。"
-                )
-                Entrez.email = default_email
-            
-            if self.config.pubmed_tool_name:
-                Entrez.tool = self.config.pubmed_tool_name
-            else:
-                Entrez.tool = "pubmed_agent"
-            
-            # 设置API key（可选，但强烈推荐以提升速率限制）
-            if self.config.pubmed_api_key:
-                Entrez.api_key = self.config.pubmed_api_key.strip()
-                logger.info("✅ 已配置PubMed API Key，速率限制已提升（10次/秒）")
-            else:
-                logger.debug("未配置 PUBMED_API_KEY，当前速率限制为3次/秒")
-            
-            # 使用速率限制器
-            self._rate_limiter.wait_if_needed()
-            
-            # 使用 efetch 获取文章详情
-            logger.info(f"Fetching article with PMID: {pmid}")
-            fetch_handle = Entrez.efetch(
-                db="pubmed",
-                id=pmid,
-                rettype="medline",  # 使用medline格式获取更全面的元数据
-                retmode="xml"
-            )
-            
-            # 解析 XML
-            try:
-                xml_data = fetch_handle.read()
-                fetch_handle.close()
-                
-                root = ET.fromstring(xml_data)
-            except ET.ParseError as e:
-                error_msg = f"Error parsing XML response for PMID {pmid}: {e}"
-                logger.error(error_msg)
-                return json.dumps({"error": error_msg, "pmid": pmid})
-            
-            # 查找文章元素
-            articles = root.findall(".//PubmedArticle")
-            
+            pmid_clean = str(pmid).strip()
+            if pmid_clean.upper().startswith("PMID:"):
+                pmid_clean = pmid_clean[5:].strip()
+            if not pmid_clean:
+                return json.dumps({"error": "PMID is required"}, ensure_ascii=False)
+
+            client = _get_mcp_client(self.config)
+            details = client.get_details(pmid_clean)
+            articles = details.get("articles", [])
             if not articles:
-                # 检查是否有错误信息
-                error_elements = root.findall(".//ERROR")
-                if error_elements:
-                    error_text = error_elements[0].text if error_elements[0].text else "Unknown error"
-                    error_msg = f"PubMed API error for PMID {pmid}: {error_text}"
-                    logger.error(error_msg)
-                    return json.dumps({"error": error_msg, "pmid": pmid})
-                
-                # 没有找到文章
-                error_msg = f"Article with PMID {pmid} not found in PubMed database."
-                logger.warning(error_msg)
-                return json.dumps({"error": error_msg, "pmid": pmid})
-            
-            # 解析第一篇文章（应该只有一篇）
-            article_elem = articles[0]
-            article_info = _parse_pubmed_article_xml(article_elem)
-            
-            if not article_info:
-                error_msg = f"Failed to parse article data for PMID {pmid}"
-                logger.error(error_msg)
-                return json.dumps({"error": error_msg, "pmid": pmid})
-            
-            # 返回JSON格式的文章数据
-            logger.info(f"Successfully fetched article: {article_info.get('title', 'Unknown')[:50]}...")
-            return json.dumps(article_info, ensure_ascii=False, indent=2)
-            
+                return json.dumps({"error": f"Article with PMID {pmid_clean} not found."}, ensure_ascii=False)
+
+            article = articles[0]
+            logger.info(f"Successfully fetched article: {article.get('title', 'Unknown')[:50]}...")
+            return json.dumps(article, ensure_ascii=False, indent=2)
+
         except Exception as e:
             error_msg = f"Error fetching article from PubMed: {str(e)}"
             logger.error(error_msg, exc_info=True)
-            return json.dumps({"error": error_msg, "pmid": pmid if 'pmid' in locals() else "unknown"})
+            return json.dumps({"error": error_msg, "pmid": pmid}, ensure_ascii=False)
     
     async def _arun(self, pmid: str) -> str:
         """Async version of PubMed fetch."""

@@ -55,7 +55,7 @@ def check_environment():
     return True
 
 def format_response(response: dict, verbose: bool = False):
-    """格式化并打印响应"""
+    """格式化并打印响应，并自动保存为Markdown文档"""
     print("\n" + "=" * 70)
     print("📋 查询结果 / Query Results")
     print("=" * 70)
@@ -94,6 +94,16 @@ def format_response(response: dict, verbose: bool = False):
     
     print("=" * 70)
     print()
+    
+    # 自动保存为Markdown文档
+    try:
+        from pubmed_agent.output_utils import save_response_to_markdown
+        saved_path = save_response_to_markdown(response)
+        print(f"💾 结果已保存到 / Result saved to: {saved_path}")
+        print()
+    except Exception as e:
+        print(f"⚠️  保存Markdown文档时出错 / Error saving Markdown: {e}")
+        print()
 
 def single_query(question: str, language: str = "auto", verbose: bool = False):
     """执行单次查询"""

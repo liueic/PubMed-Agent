@@ -16,6 +16,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
+cache/
 
 # 分发/打包
 build/

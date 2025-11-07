@@ -1378,6 +1378,10 @@ class PubMedAgent:
         """
         self.config = config or AgentConfig()
         self.language = language
+
+        # Conversation/session state
+        self._session_thread_id: Optional[str] = None
+        self._current_thread_id: Optional[str] = None
         
         # Initialize LLM - 支持多种大模型供应商
         # 构建 LLM 初始化参数
@@ -1448,6 +1452,14 @@ class PubMedAgent:
             else:
                 system_prompt_text = str(system_prompt)
             
+            # Load and combine role prompt if configured
+            from .role_loader import combine_role_prompt_with_system_prompt
+            system_prompt_text = combine_role_prompt_with_system_prompt(
+                system_prompt=system_prompt_text,
+                role_name=self.config.role_name,
+                role_file_path=self.config.role_file_path
+            )
+            
             # Create agent graph (already compiled in LangChain 1.0+)
             agent_executor = create_agent(
                 model=self.llm,
@@ -1482,6 +1494,20 @@ class PubMedAgent:
                 structured=True  # Default to structured workflow
             )
             
+            # Load and combine role prompt if configured
+            from .role_loader import combine_role_prompt_with_system_prompt
+            if hasattr(prompt, 'template'):
+                # Extract the base template
+                base_template = prompt.template
+                # Combine with role prompt
+                combined_template = combine_role_prompt_with_system_prompt(
+                    system_prompt=base_template,
+                    role_name=self.config.role_name,
+                    role_file_path=self.config.role_file_path
+                )
+                # Update the prompt template
+                prompt.template = combined_template
+            
             # Create ReAct agent
             agent = create_react_agent(
                 llm=self.llm,
@@ -1503,6 +1529,10 @@ class PubMedAgent:
             
             return agent_executor
     
+    def _thread_id_getter(self) -> Optional[str]:
+        """Return the active thread_id for vector database operations."""
+        return self._current_thread_id or self._session_thread_id
+
     def start_new_session(self) -> str:
         """
         Start a new conversation session.
@@ -1730,6 +1760,14 @@ class PubMedAgent:
                 system_prompt_text = system_prompt.template.split("Question:")[0].strip()
             else:
                 system_prompt_text = str(system_prompt)
+            
+            # Load and combine role prompt if configured
+            from .role_loader import combine_role_prompt_with_system_prompt
+            system_prompt_text = combine_role_prompt_with_system_prompt(
+                system_prompt=system_prompt_text,
+                role_name=self.config.role_name,
+                role_file_path=self.config.role_file_path
+            )
             
             # Create agent graph (already compiled)
             agent_executor = create_agent(
