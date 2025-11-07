@@ -53,12 +53,26 @@ class PubMedAgent:
         self.config = config or AgentConfig()
         self.language = language
         
-        # Initialize LLM with controlled temperature for factual responses
-        self.llm = ChatOpenAI(
-            model=self.config.openai_model,
-            temperature=self.config.temperature,  # Phase 2: Temperature control for reduced hallucinations
-            openai_api_key=self.config.openai_api_key
-        )
+        # Initialize LLM - 支持多种大模型供应商
+        # 构建 LLM 初始化参数
+        llm_kwargs = {
+            "model": self.config.llm_model,
+            "temperature": self.config.temperature,
+            "openai_api_key": self.config.llm_api_key,
+        }
+        
+        # 添加 top_p 参数（默认 0.95，适合大多数模型）
+        model_kwargs = {}
+        if hasattr(self.config, 'top_p') and self.config.top_p is not None:
+            model_kwargs["top_p"] = self.config.top_p
+        if model_kwargs:
+            llm_kwargs["model_kwargs"] = model_kwargs
+        
+        # 如果设置了自定义 base_url，则使用它（支持 Azure、本地模型等）
+        if self.config.llm_base_url:
+            llm_kwargs["base_url"] = self.config.llm_base_url
+        
+        self.llm = ChatOpenAI(**llm_kwargs)
         
         # Initialize tools
         self.tools = create_tools(self.config)
@@ -312,8 +326,10 @@ class PubMedAgent:
         return {
             "total_tools": len(self.tools),
             "available_tools": self.get_available_tools(),
-            "llm_model": self.config.openai_model,
+            "llm_model": self.config.llm_model,
+            "llm_base_url": self.config.llm_base_url or "default",
             "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
             "vector_db_type": self.config.vector_db_type,
             "max_iterations": 10,
             "memory_messages": len(self.get_conversation_history()),
