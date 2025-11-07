@@ -2,6 +2,7 @@
 langchain>=0.1.0
 langchain-openai>=0.0.5
 langchain-community>=0.0.10
+openai>=1.0.0  # For DashScope and OpenAI API compatibility
 
 # Vector databases
 chromadb>=0.4.0

@@ -108,10 +108,21 @@ source venv/bin/activate
 
 # Install dependencies (安装依赖)
 pip install -r requirements.txt
+```
 
-# Set up environment variables (设置环境变量)
+### 环境变量配置 (Environment Variables Setup)
+
+```bash
+# 复制环境变量模板文件
+# Copy environment variables template
 cp .env.example .env
-# Edit .env with your API keys (编辑.env文件填入API密钥)
+
+# 编辑 .env 文件，填入你的API密钥
+# Edit .env file and fill in your API keys
+# 必需配置:
+# - OPENAI_API_KEY: 你的API密钥（OpenAI或其他兼容服务的密钥）
+# Required configuration:
+# - OPENAI_API_KEY: Your API key (OpenAI or other compatible service)
 ```
 
 ### 环境配置文件说明 (Environment Configuration)
@@ -214,6 +225,32 @@ This **ReAct PubMed Agent** is not just a "chatbot" - it's a **scientific intell
 - 🌏 **Multi-language support** for broader accessibility (多语言支持)
 
 **You're not just training models—you're orchestrating intelligence!** (您不是在训练模型——您在编排智能！) 🚀
+
+## 🖥️ 命令行使用 (Command Line Usage)
+
+项目提供了完整的命令行接口，可以直接从终端使用：
+
+The project provides a complete command-line interface:
+
+```bash
+# 基本查询 / Basic query
+pubmed-agent query "mRNA疫苗的作用机制是什么？"
+
+# 交互式模式 / Interactive mode
+pubmed-agent interactive
+
+# 搜索文献 / Search articles
+pubmed-agent search "COVID-19 vaccine" --max-results 5
+
+# 查看统计信息 / View statistics
+pubmed-agent stats
+```
+
+**详细文档**: 查看 [CLI_USAGE.md](CLI_USAGE.md) 获取完整的命令行使用指南。
+
+**Documentation**: See [CLI_USAGE.md](CLI_USAGE.md) for complete CLI usage guide.
+
+---
 
 ## 📋 Usage Examples (使用示例)
 

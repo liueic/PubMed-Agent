@@ -35,12 +35,17 @@ class PubMedArticle:
             self.keywords = []
 
 
-def setup_logging(log_level: str = "INFO") -> None:
-    """Setup logging configuration."""
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper()),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None, detailed: bool = False) -> None:
+    """
+    设置日志配置，使用统一的日志配置模块
+    
+    Args:
+        log_level: 日志级别 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_file: 日志文件路径，如果为None则不写入文件
+        detailed: 是否显示详细信息（时间戳、函数名等）
+    """
+    from .logging_config import setup_logging as setup_logging_impl
+    setup_logging_impl(log_level=log_level, log_file=log_file, detailed=detailed, use_color=True)
 
 
 def clean_text(text: str) -> str:
