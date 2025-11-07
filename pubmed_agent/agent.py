@@ -1379,208 +1379,26 @@ class PubMedAgent:
         self.config = config or AgentConfig()
         self.language = language
         
-        # 初始化日志系统（如果尚未初始化）
-        if not logging.getLogger().handlers:
-            setup_logging(
-                log_level=self.config.log_level,
-                log_file=self.config.log_file,  # 使用配置中的日志文件路径
-                detailed=False
-            )
-        
-        # Thread ID management for vector database isolation
-        self._current_thread_id: Optional[str] = None
-        self._thread_id_getter: Optional[Callable[[], Optional[str]]] = None
-        
-        # Session management for multi-turn conversations
-        self._session_thread_id: Optional[str] = None
-        
-        # Initialize LLM with controlled temperature for factual responses
-        # Support custom API endpoint for compatibility with OpenAI-compatible APIs
+        # Initialize LLM - 支持多种大模型供应商
+        # 构建 LLM 初始化参数
         llm_kwargs = {
-            "model": self.config.openai_model,
-            "temperature": self.config.temperature,  # Phase 2: Temperature control for reduced hallucinations
-            "openai_api_key": self.config.openai_api_key
+            "model": self.config.llm_model,
+            "temperature": self.config.temperature,
+            "openai_api_key": self.config.llm_api_key,
         }
         
-        # Add custom base_url if provided (for custom endpoints like local models, Azure, etc.)
-        if self.config.openai_api_base:
-            llm_kwargs["base_url"] = self.config.openai_api_base
-            logger.info(f"Using custom API endpoint: {self.config.openai_api_base}")
-        else:
-            logger.info("Using default OpenAI API endpoint")
+        # 添加 top_p 参数（默认 0.95，适合大多数模型）
+        model_kwargs = {}
+        if hasattr(self.config, 'top_p') and self.config.top_p is not None:
+            model_kwargs["top_p"] = self.config.top_p
+        if model_kwargs:
+            llm_kwargs["model_kwargs"] = model_kwargs
         
-        # 记录实际使用的完整API配置
-        logger.info(f"API Configuration - Model: {self.config.openai_model}, Endpoint: {llm_kwargs.get('base_url', 'default OpenAI API')}")
+        # 如果设置了自定义 base_url，则使用它（支持 Azure、本地模型等）
+        if self.config.llm_base_url:
+            llm_kwargs["base_url"] = self.config.llm_base_url
         
-        # 创建基础LLM
-        base_llm = ChatOpenAI(**llm_kwargs)
-        
-        # 创建包装类以修复tool_calls（使用组合而不是继承）
-        class FixedChatOpenAI:
-            """包装ChatOpenAI以自动修复tool_calls中的args"""
-            
-            def __init__(self, base_llm_instance):
-                self._base_llm = base_llm_instance
-            
-            def _fix_response_before_validation(self, response_data):
-                """
-                在Pydantic验证之前修复响应数据。
-                尝试从原始响应数据中修复tool_calls的args字段。
-                """
-                try:
-                    # 如果response_data是字典（可能是原始API响应），尝试修复
-                    if isinstance(response_data, dict):
-                        # 检查是否有tool_calls字段
-                        if 'tool_calls' in response_data:
-                            tool_calls = response_data['tool_calls']
-                            if isinstance(tool_calls, list):
-                                fixed_tool_calls = []
-                                for tc in tool_calls:
-                                    if isinstance(tc, dict) and 'args' in tc:
-                                        if isinstance(tc['args'], str):
-                                            parsed = _recursive_parse_json(tc['args'])
-                                            if isinstance(parsed, dict):
-                                                tc['args'] = parsed
-                                                fixed_tool_calls.append(tc)
-                                            else:
-                                                fixed_tool_calls.append(tc)
-                                        else:
-                                            fixed_tool_calls.append(tc)
-                                    else:
-                                        fixed_tool_calls.append(tc)
-                                response_data['tool_calls'] = fixed_tool_calls
-                        # 检查choices字段（OpenAI格式）
-                        if 'choices' in response_data:
-                            for choice in response_data.get('choices', []):
-                                if 'message' in choice:
-                                    message = choice['message']
-                                    if 'tool_calls' in message:
-                                        tool_calls = message['tool_calls']
-                                        if isinstance(tool_calls, list):
-                                            fixed_tool_calls = []
-                                            for tc in tool_calls:
-                                                if isinstance(tc, dict) and 'function' in tc:
-                                                    func = tc['function']
-                                                    if isinstance(func, dict) and 'arguments' in func:
-                                                        if isinstance(func['arguments'], str):
-                                                            parsed = _recursive_parse_json(func['arguments'])
-                                                            if isinstance(parsed, dict):
-                                                                func['arguments'] = parsed
-                                                            fixed_tool_calls.append(tc)
-                                                        else:
-                                                            fixed_tool_calls.append(tc)
-                                                    else:
-                                                        fixed_tool_calls.append(tc)
-                                                else:
-                                                    fixed_tool_calls.append(tc)
-                                            message['tool_calls'] = fixed_tool_calls
-                except Exception as e:
-                    logger.warning(f"Error fixing response before validation: {e}")
-                return response_data
-            
-            def invoke(self, input, config=None, **kwargs):
-                """调用LLM并修复返回的消息"""
-                try:
-                    result = self._base_llm.invoke(input, config=config, **kwargs)
-                    return _fix_tool_calls_args(result)
-                except Exception as e:
-                    # 如果验证失败，尝试从错误中提取信息并修复
-                    error_str = str(e)
-                    if "tool_calls" in error_str and ("dict_type" in error_str or "Input should be a valid dictionary" in error_str):
-                        logger.warning(f"Caught validation error for tool_calls, attempting to fix: {e}")
-                        # 尝试从原始响应中修复
-                        try:
-                            # 检查base_llm是否有_client属性，如果有，我们可以尝试直接调用API
-                            if hasattr(self._base_llm, '_client'):
-                                # 尝试使用原始客户端调用，然后在响应中修复
-                                import inspect
-                                # 获取调用的原始参数
-                                # 这里我们需要手动构造消息并调用API
-                                pass
-                            
-                            # 如果无法从底层修复，尝试使用LangChain的fallback机制
-                            # 创建一个修复后的消息对象
-                            from langchain_core.messages import AIMessage
-                            from langchain_core.exceptions import OutputParserException
-                            
-                            # 尝试从错误信息中提取tool_calls数据
-                            # 错误信息格式: Input should be a valid dictionary [type=dict_type, input_value='{"query": "..."}', input_type=str]
-                            import re
-                            match = re.search(r"input_value='([^']+)'", error_str)
-                            if match:
-                                args_str = match.group(1)
-                                # 尝试解析args字符串
-                                parsed_args = _recursive_parse_json(args_str)
-                                if isinstance(parsed_args, dict):
-                                    logger.info(f"Successfully parsed args from error message: {list(parsed_args.keys())}")
-                                    # 这里我们需要重新构造消息，但我们需要完整的tool_call信息
-                                    # 由于信息不完整，我们只能记录并重试
-                                    pass
-                            
-                            # 如果所有修复尝试都失败，重新调用（可能会再次失败，但至少尝试了）
-                            logger.warning("Retrying LLM call after validation error...")
-                            result = self._base_llm.invoke(input, config=config, **kwargs)
-                            return _fix_tool_calls_args(result)
-                        except Exception as inner_e:
-                            logger.error(f"Failed to fix validation error: {inner_e}")
-                            # 如果修复失败，抛出原始错误
-                            raise e
-                    raise
-            
-            def batch(self, inputs, config=None, **kwargs):
-                """批量调用LLM并修复返回的消息"""
-                try:
-                    results = self._base_llm.batch(inputs, config=config, **kwargs)
-                    return [_fix_tool_calls_args(msg) for msg in results]
-                except Exception as e:
-                    logger.warning(f"Error in batch call: {e}")
-                    # 尝试修复后重新调用
-                    results = self._base_llm.batch(inputs, config=config, **kwargs)
-                    return [_fix_tool_calls_args(msg) for msg in results]
-            
-            def stream(self, input, config=None, **kwargs):
-                """流式调用LLM并修复返回的消息"""
-                try:
-                    for chunk in self._base_llm.stream(input, config=config, **kwargs):
-                        yield _fix_tool_calls_args(chunk)
-                except Exception as e:
-                    logger.warning(f"Error in stream call: {e}")
-                    for chunk in self._base_llm.stream(input, config=config, **kwargs):
-                        yield _fix_tool_calls_args(chunk)
-            
-            # 代理所有其他方法和属性到base_llm
-            def __getattr__(self, name):
-                """代理未定义的属性和方法到base_llm"""
-                attr = getattr(self._base_llm, name)
-                if callable(attr):
-                    # 如果是方法，包装它以确保返回的消息也被修复
-                    def wrapper(*args, **kwargs):
-                        try:
-                            result = attr(*args, **kwargs)
-                            # 如果结果是消息对象，修复它
-                            if hasattr(result, 'tool_calls'):
-                                return _fix_tool_calls_args(result)
-                            return result
-                        except Exception as e:
-                            # 如果调用失败且是验证错误，尝试修复
-                            error_str = str(e)
-                            if "tool_calls" in error_str:
-                                logger.warning(f"Error in {name}, attempting fix: {e}")
-                                raise
-                            raise
-                    return wrapper
-                return attr
-        
-        # 使用包装的LLM
-        self.llm = FixedChatOpenAI(base_llm)
-        
-        # Initialize tools with thread_id_getter (will be set up in _create_agent)
-        # 先创建thread_id_getter函数
-        def get_thread_id():
-            """获取当前thread_id"""
-            return self._current_thread_id
-        
-        self._thread_id_getter = get_thread_id
+        self.llm = ChatOpenAI(**llm_kwargs)
         
         # Initialize tools
         self.tools = create_tools(self.config, thread_id_getter=self._thread_id_getter)
@@ -2203,8 +2021,10 @@ class PubMedAgent:
         return {
             "total_tools": len(self.tools),
             "available_tools": self.get_available_tools(),
-            "llm_model": self.config.openai_model,
+            "llm_model": self.config.llm_model,
+            "llm_base_url": self.config.llm_base_url or "default",
             "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
             "vector_db_type": self.config.vector_db_type,
             "max_iterations": 10,
             "memory_messages": len(self.get_conversation_history()),
