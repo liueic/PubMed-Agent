@@ -26,7 +26,6 @@ dependencies = [
     "langchain-community>=0.0.10",
     "chromadb>=0.4.0",
     "faiss-cpu>=1.7.4",
-    "biopython>=1.81",
     "numpy>=1.24.0",
     "pandas>=2.0.0",
     "requests>=2.31.0",
@@ -59,7 +58,7 @@ build-backend = "setuptools.build_meta"
 pubmed-agent = "pubmed_agent.cli:main"
 
 [tool.setuptools]
-packages = ["pubmed_agent"]
+packages = ["pubmed_agent", "pubmed_mcp"]
 
 [tool.setuptools.package-data]
 pubmed_agent = ["py.typed"]

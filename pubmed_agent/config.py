@@ -60,6 +60,18 @@ class AgentConfig(BaseModel):
         env_values["pubmed_email"] = os.getenv("PUBMED_EMAIL")
         env_values["pubmed_tool_name"] = os.getenv("PUBMED_TOOL_NAME", "pubmed_agent")
         env_values["pubmed_api_key"] = os.getenv("PUBMED_API_KEY")
+        env_values["pubmed_backend"] = os.getenv("PUBMED_BACKEND", "python_mcp")
+        env_values["pubmed_mcp_base_dir"] = os.getenv("PUBMED_MCP_BASE_DIR", os.getenv("PUBMED_MCP_CACHE_DIR", "./"))
+        env_values["pubmed_abstract_mode"] = os.getenv("ABSTRACT_MODE", "quick")
+        env_values["pubmed_fulltext_mode"] = os.getenv("FULLTEXT_MODE", "disabled")
+        env_values["pubmed_endnote_export"] = os.getenv("ENDNOTE_EXPORT", "enabled")
+        env_values["pubmed_proxy_enabled"] = os.getenv("PROXY_ENABLED", "disabled")
+        env_values["pubmed_http_proxy"] = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+        env_values["pubmed_https_proxy"] = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+        env_values["pubmed_proxy_username"] = os.getenv("PROXY_USERNAME")
+        env_values["pubmed_proxy_password"] = os.getenv("PROXY_PASSWORD")
+        env_values["pubmed_proxy_timeout"] = int(os.getenv("PROXY_TIMEOUT", "30"))
+        env_values["pubmed_proxy_retry_count"] = int(os.getenv("PROXY_RETRY_COUNT", "3"))
         
         # 嵌入模型配置 - 支持独立供应商
         # 如果用户填写了独立的 embedding 配置，则使用用户的配置
@@ -86,6 +98,19 @@ class AgentConfig(BaseModel):
         # 日志配置
         env_values["log_level"] = os.getenv("LOG_LEVEL", "INFO")
         env_values["log_file"] = os.getenv("LOG_FILE")  # 可选，如果未设置则为None
+        
+        # 角色提示词配置
+        # 如果未设置，默认尝试加载 "Synapse Scholar" 角色（如果文件存在）
+        env_values["role_name"] = os.getenv("AGENT_ROLE_NAME")  # 角色名称，如 "Synapse Scholar"
+        env_values["role_file_path"] = os.getenv("AGENT_ROLE_FILE")  # 角色文件路径，如 "agents/Synapse Scholar.md"
+        
+        # 如果都没有设置，默认尝试加载 "Synapse Scholar"
+        if not env_values["role_name"] and not env_values["role_file_path"]:
+            from pathlib import Path
+            project_root = Path(__file__).parent.parent
+            default_role_path = project_root / "agents" / "Synapse Scholar.md"
+            if default_role_path.exists():
+                env_values["role_name"] = "Synapse Scholar"
         
         # Override with explicit kwargs
         env_values.update(kwargs)
@@ -146,6 +171,18 @@ class AgentConfig(BaseModel):
     pubmed_email: Optional[str] = None
     pubmed_tool_name: str = "pubmed_agent"
     pubmed_api_key: Optional[str] = None
+    pubmed_backend: str = "python_mcp"
+    pubmed_mcp_base_dir: str = "./"
+    pubmed_abstract_mode: str = "quick"
+    pubmed_fulltext_mode: str = "disabled"
+    pubmed_endnote_export: str = "enabled"
+    pubmed_proxy_enabled: str = "disabled"
+    pubmed_http_proxy: Optional[str] = None
+    pubmed_https_proxy: Optional[str] = None
+    pubmed_proxy_username: Optional[str] = None
+    pubmed_proxy_password: Optional[str] = None
+    pubmed_proxy_timeout: int = 30
+    pubmed_proxy_retry_count: int = 3
     
     # 嵌入模型配置 - 支持独立供应商
     embedding_api_key: Optional[str] = None  # 如果为空，则使用 LLM API Key
@@ -160,3 +197,8 @@ class AgentConfig(BaseModel):
     
     # 日志配置
     log_level: str = "INFO"
+    log_file: Optional[str] = None
+    
+    # 角色提示词配置
+    role_name: Optional[str] = None  # 角色名称，如 "Synapse Scholar"
+    role_file_path: Optional[str] = None  # 角色文件路径，如 "agents/Synapse Scholar.md"
